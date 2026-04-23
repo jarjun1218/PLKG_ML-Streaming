@@ -43,7 +43,9 @@ def get_key(epoch):
 def keygen_thread():
     global gsn_raw
     model = load_model("model_reserved/cnn_basic/model_final.pth")
-    watcher = CSISerialWatcher("/dev/ttyUSB0", 115200)
+    # watcher = CSISerialWatcher("/dev/ttyUSB0", 115200)
+    watcher = CSISerialWatcher("/dev/tty.usbserial-0001", 115200)  # macOS
+    # watcher = CSISerialWatcher("COM3", 115200)  # Windows
     watcher.start()
 
     last_serial = None
