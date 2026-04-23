@@ -1,0 +1,12 @@
+numpy
+torch # 或對應環境的 PyTorch 版本
+opencv-python
+cryptography
+pyserial
+reedsolo
+
+# ---- 樹莓派專用相機套件 ----
+# 注意：若您在 Raspberry Pi OS 使用 picamera2
+# 通常不需要透過 pip 安裝，而是透過系統 apt 安裝：
+# sudo apt install python3-libcamera python3-kms++ python3-picamera2
+# picamera2

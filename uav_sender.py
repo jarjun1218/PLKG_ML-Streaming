@@ -5,12 +5,13 @@ import time
 
 
 class UAVKeySender:
-    def __init__(self, get_key_state, gsn_ip, port=5007):
+    def __init__(self, get_key_state, gsn_ip, port=5007, debug=False):
         """
         get_key_state() -> (epoch, raw_key, parity_b64)
         """
         self.get_key_state = get_key_state
         self.gsn_ip = gsn_ip
+        self.debug = debug
         self.port = port
 
     def run(self):

@@ -1,15 +1,10 @@
-# uav_stream.py  (LIBRARY, memory-only, epoch-ready)  [方案A：在 streamer 內顯示預覽]
-#
-# 最小改動：
-# - 加 preview 相關參數
-# - capture_array() 後面加 imshow/waitKey
-# - 按 q 離開
-# - finally 做資源清理
-
+import os
+import queue
 import socket
 import struct
+import threading
 import time
-import os
+
 import cv2
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from picamera2 import Picamera2
@@ -21,70 +16,108 @@ class UAVVideoStreamer:
         get_video_key,
         gsn_ip,
         port=5005,
-        chunk=4096,
+        chunk=1200,
         preview=False,
+        debug=False,
         window_name="UAV Camera",
         preview_wait=1,
+        resolution=(960, 540),
+        fps=20,
+        jpeg_quality=45,
     ):
         """
         get_video_key() -> (epoch, aes_key)
-
-        preview:      True 就在 UAV 本地顯示相機畫面
-        window_name:  視窗名稱
-        preview_wait: cv2.waitKey 的等待時間(ms)，1 通常就夠
         """
         self.get_video_key = get_video_key
         self.gsn_ip = gsn_ip
         self.port = port
         self.chunk = chunk
+        self.resolution = resolution
+        self.fps = fps
+        self.jpeg_quality = jpeg_quality
 
         self.preview = preview
+        self.debug = debug
         self.window_name = window_name
         self.preview_wait = preview_wait
 
-    def run(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Keep only the newest frame to avoid queue-backed latency growth.
+        self.frame_queue = queue.Queue(maxsize=1)
+        self.running = False
+        self.frame_interval = 1.0 / fps if fps > 0 else 0.0
 
-        cam = Picamera2()
-        cam.configure(cam.create_video_configuration(main={"size": (640, 480)}))
-        cam.start()
-
+    def _producer(self, cam):
         frame_id = 0
-        print("[UAV] video stream started")
-
         try:
-            while True:
+            while self.running:
+                loop_start = time.perf_counter()
                 frame_id += 1
 
-                # 1) capture
-                frame = cam.capture_array()
+                try:
+                    frame = cam.capture_array()
+                    frame = cv2.flip(frame, -1)
+                except Exception as e:
+                    print(f"Capture error: {e}")
+                    continue
 
-                # 2) 本地預覽（最小新增）
                 if self.preview:
-                    # 如果你發現顏色顛倒，再改成：
-                    # cv2.imshow(self.window_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                    cv2.imshow(self.window_name, frame)
+                    preview_frame = cv2.resize(frame, (640, 480))
+                    cv2.imshow(self.window_name, preview_frame)
                     key = cv2.waitKey(self.preview_wait) & 0xFF
                     if key == ord("q"):
                         print("[UAV] preview quit (q pressed)")
+                        self.running = False
                         break
 
-                # 3) encode jpg
-                ok, jpg = cv2.imencode(".jpg", frame)
+                ok, jpg = cv2.imencode(
+                    ".jpg",
+                    frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality],
+                )
                 if not ok:
                     continue
 
-                # 4) get key
+                jpg_bytes = jpg.tobytes()
+
+                if self.frame_queue.full():
+                    try:
+                        self.frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+
+                self.frame_queue.put((frame_id, jpg_bytes))
+
+                if self.frame_interval > 0:
+                    elapsed = time.perf_counter() - loop_start
+                    sleep_time = self.frame_interval - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+
+        except Exception as e:
+            print(f"[Producer Error] {e}")
+            self.running = False
+
+    def _consumer(self, sock):
+        last_epoch = None
+        aes_cipher = None
+
+        try:
+            while self.running:
+                try:
+                    frame_id, jpg_bytes = self.frame_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
                 epoch, aes_key = self.get_video_key()
                 if aes_key is None:
                     continue
 
-                # 5) encrypt (nonce + ciphertext)
-                aes = AESGCM(aes_key)
-                nonce = os.urandom(12)
-                encrypted = nonce + aes.encrypt(nonce, jpg.tobytes(), None)
+                if epoch != last_epoch or aes_cipher is None:
+                    aes_cipher = AESGCM(aes_key)
+                    last_epoch = epoch
 
-                # 6) chunk + send
+                nonce = os.urandom(12)
+                encrypted = nonce + aes_cipher.encrypt(nonce, jpg_bytes, None)
                 chunks = [
                     encrypted[i : i + self.chunk]
                     for i in range(0, len(encrypted), self.chunk)
@@ -101,18 +134,70 @@ class UAVVideoStreamer:
                     pkt = b"P" + struct.pack("!I I", frame_id, idx) + ch
                     sock.sendto(pkt, (self.gsn_ip, self.port))
 
+        except Exception as e:
+            print(f"[Consumer Error] {e}")
+            self.running = False
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+        except Exception:
+            pass
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)
+        except Exception:
+            pass
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_PRIORITY, 6)
+        except Exception:
+            pass
+
+        cam = Picamera2()
+        config = cam.create_video_configuration(
+            main={"size": self.resolution, "format": "RGB888"},
+            buffer_count=2,
+        )
+        cam.configure(config)
+        cam.start()
+
+        try:
+            cam.set_controls({"FrameRate": self.fps, "ExposureTime": 20000})
+        except Exception as e:
+            print(f"[Cam Warning] {e}")
+
+        print(
+            f"[UAV] video stream started: {self.resolution} @ {self.fps}fps, "
+            f"JPEG={self.jpeg_quality}, chunk={self.chunk}"
+        )
+        self.running = True
+
+        producer_thread = threading.Thread(target=self._producer, args=(cam,))
+        consumer_thread = threading.Thread(target=self._consumer, args=(sock,))
+        producer_thread.start()
+        consumer_thread.start()
+
+        try:
+            while self.running:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("[UAV] Interrupted by user")
+            self.running = False
         finally:
-            # 清理資源，避免相機/視窗卡住
+            self.running = False
+            producer_thread.join(timeout=2)
+            consumer_thread.join(timeout=2)
+
             try:
                 cam.stop()
-            except:
+            except Exception:
                 pass
             try:
                 sock.close()
-            except:
+            except Exception:
                 pass
             if self.preview:
                 try:
                     cv2.destroyWindow(self.window_name)
-                except:
+                except Exception:
                     pass

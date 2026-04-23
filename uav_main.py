@@ -31,9 +31,15 @@ from uav_stream import UAVVideoStreamer
 # ======================================================
 # Config
 # ======================================================
-GSN_IP = "192.168.68.104"
+GSN_IP = "192.168.0.149"
 CSI_PORT = "/dev/ttyUSB0"
 CSI_BAUD = 115200
+DEBUG = False
+PREVIEW = False
+VIDEO_RESOLUTION = (960, 540)
+VIDEO_FPS = 20
+VIDEO_JPEG_QUALITY = 45
+VIDEO_CHUNK = 1200
 
 MODEL_CSI_PATH = "model_reserved/cnn_basic/model_final.pth"
 MODEL_KEY_QUAN_PATH = "model_reserved/cnn_basic_quan/model_final.pth"
@@ -129,7 +135,7 @@ class CSISerialWatcher:
 # ======================================================
 # CNN-Q key reconstruction
 # ======================================================
-def reconstruct_key_cnnq(model_q, raw_bits: str) -> str:
+def reconstruct_key_cnnq(model_q, raw_bits: str, debug: bool = False) -> str:
     """
     raw_bits: 102-bit string
     return: reconstructed 102-bit string
@@ -142,10 +148,10 @@ def reconstruct_key_cnnq(model_q, raw_bits: str) -> str:
 
     with torch.no_grad():
         out = model_q(torch.from_numpy(key_pair))
-    print("[DEBUG CNN-Q] out type :", type(out))
-    print("[DEBUG CNN-Q] out shape:", out.shape if hasattr(out, "shape") else "no shape")
-    print("[DEBUG CNN-Q] out value:", out)
-    # ===== 🔧 關鍵修正在這裡 =====
+    if debug:
+        print("[DEBUG CNN-Q] out type :", type(out))
+        print("[DEBUG CNN-Q] out shape:", out.shape if hasattr(out, "shape") else "no shape")
+        print("[DEBUG CNN-Q] out value:", out)
     out_np = out.detach().cpu().numpy()
 
     # 不管 shape 是 (1,102)、(102,) 還是怪的，全部攤平
@@ -203,7 +209,7 @@ def keygen_thread():
         raw_key = force_102_bits("".join(str(b) for b in bits))
 
         # === Step 2: CNN-Q reconstruction ===
-        key_uav_p = reconstruct_key_cnnq(model_q, raw_key)
+        key_uav_p = reconstruct_key_cnnq(model_q, raw_key, debug=DEBUG)
 
         # === Step 3-1: AES key ===
         aes_key = sha256.sha_byte(key_uav_p)
@@ -223,11 +229,20 @@ if __name__ == "__main__":
     threading.Thread(target=keygen_thread, daemon=True).start()
 
     # Parity sender
-    sender = UAVKeySender(key_state.for_parity, GSN_IP)
+    sender = UAVKeySender(key_state.for_parity, GSN_IP, debug=DEBUG)
     threading.Thread(target=sender.run, daemon=True).start()
 
     # Video streamer (preview in main thread is more stable)
-    streamer = UAVVideoStreamer(key_state.for_video, GSN_IP, preview=True)
+    streamer = UAVVideoStreamer(
+        key_state.for_video,
+        GSN_IP,
+        preview=PREVIEW,
+        debug=DEBUG,
+        resolution=VIDEO_RESOLUTION,
+        fps=VIDEO_FPS,
+        jpeg_quality=VIDEO_JPEG_QUALITY,
+        chunk=VIDEO_CHUNK,
+    )
 
     print("[UAV] system ready (press q to quit preview)")
     streamer.run()
