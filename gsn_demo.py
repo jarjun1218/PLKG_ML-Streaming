@@ -41,6 +41,9 @@ class GSNState:
 
     latest_latency_ms: float | None = None
     latest_frame_bgr: np.ndarray | None = None
+    latest_frame_time: float | None = None
+    video_status: str = "Waiting for frames..."
+    video_status_level: str = "idle"
 
     latest_kdr_raw: float | None = None
     latest_kdr_corr: float | None = None
@@ -84,6 +87,10 @@ class GSNDashboard(tk.Tk):
         style.configure("Muted.TLabel", background="#111827", foreground="#94a3b8", font=("Arial", 10))
         style.configure("Header.TLabel", background="#0f172a", foreground="#f8fafc", font=("Arial", 15, "bold"))
         style.configure("TButton", font=("Arial", 11, "bold"), padding=8)
+        style.configure("StatusIdle.TLabel", background="#111827", foreground="#94a3b8", font=("Arial", 10, "bold"))
+        style.configure("StatusWarn.TLabel", background="#111827", foreground="#fbbf24", font=("Arial", 10, "bold"))
+        style.configure("StatusGood.TLabel", background="#111827", foreground="#34d399", font=("Arial", 10, "bold"))
+        style.configure("StatusBad.TLabel", background="#111827", foreground="#f87171", font=("Arial", 10, "bold"))
 
     def _build_layout(self):
         root = ttk.Frame(self, style="Root.TFrame", padding=12)
@@ -138,6 +145,8 @@ class GSNDashboard(tk.Tk):
         ttk.Label(video_card, text="Decrypted Video", style="Title.TLabel").pack(anchor="w")
         self.video_label = tk.Label(video_card, text="Waiting for frames...", bg="#020617", fg="#cbd5e1")
         self.video_label.pack(fill="both", expand=True, pady=(8, 0))
+        self.video_hint = ttk.Label(video_card, text="Waiting for UAV video stream.", style="StatusIdle.TLabel")
+        self.video_hint.pack(anchor="w", pady=(8, 0))
 
         right = ttk.Frame(body, style="Root.TFrame")
         right.grid(row=0, column=1, sticky="nsew", pady=(0, 6))
@@ -215,6 +224,9 @@ class GSNDashboard(tk.Tk):
         self.start_btn.state(["disabled"])
         self.status_banner.config(text="Starting backend...")
         self.log("Starting GSN backend.")
+        with self.state_obj.lock:
+            self.state_obj.video_status = "Backend starting. Waiting for UAV key and video."
+            self.state_obj.video_status_level = "idle"
 
         t1 = threading.Thread(target=self._keygen_worker, daemon=True)
         t2 = threading.Thread(target=self._rs_worker, daemon=True)
@@ -295,6 +307,7 @@ class GSNDashboard(tk.Tk):
             self.log(f"RS receiver init failed: {e}")
             return
 
+        last_epoch = -1
         while True:
             try:
                 data, _ = sock.recvfrom(1024*1024)
@@ -304,6 +317,18 @@ class GSNDashboard(tk.Tk):
                 epoch = int(parts[1])
                 uav_raw = parts[2]
                 parity = parts[3]
+
+                if last_epoch >= 0 and epoch < last_epoch:
+                    with self.state_obj.lock:
+                        self.state_obj.keys_by_epoch.clear()
+                        self.state_obj.last_epoch = None
+                        self.state_obj.active_key = None
+                        self.state_obj.latest_frame_bgr = None
+                        self.state_obj.latest_frame_time = None
+                        self.state_obj.video_status = "UAV reboot detected. Waiting for key resync and fresh video."
+                        self.state_obj.video_status_level = "warn"
+                    self.log(f"UAV key session reset detected: epoch {last_epoch}->{epoch}")
+                last_epoch = epoch
 
                 with self.state_obj.lock:
                     local_raw = self.state_obj.gsn_raw
@@ -319,6 +344,8 @@ class GSNDashboard(tk.Tk):
                     self.state_obj.keys_by_epoch[epoch] = aes
                     self.state_obj.last_epoch = epoch
                     self.state_obj.active_key = aes
+                    self.state_obj.video_status = "Key synced. Waiting for fresh decrypted video."
+                    self.state_obj.video_status_level = "warn"
                     self.state_obj.latest_kdr_raw = raw_kdr
                     self.state_obj.latest_kdr_corr = corr_kdr
                     self.state_obj.kdr_raw_hist.append(raw_kdr)
@@ -335,6 +362,9 @@ class GSNDashboard(tk.Tk):
         with self.state_obj.lock:
             self.state_obj.latest_frame_bgr = frame.copy()
             self.state_obj.latest_latency_ms = float(latency)
+            self.state_obj.latest_frame_time = time.time()
+            self.state_obj.video_status = "Video streaming normally."
+            self.state_obj.video_status_level = "good"
             self.state_obj.latency_hist.append(float(latency))
 
     def _get_key(self, epoch):
@@ -372,11 +402,14 @@ class GSNDashboard(tk.Tk):
                 noise = self.state_obj.latest_noise
                 epoch = self.state_obj.last_epoch
                 latency = self.state_obj.latest_latency_ms
+                frame_time = self.state_obj.latest_frame_time
                 raw_kdr = self.state_obj.latest_kdr_raw
                 corr_kdr = self.state_obj.latest_kdr_corr
                 frame = None if self.state_obj.latest_frame_bgr is None else self.state_obj.latest_frame_bgr.copy()
                 gsn_raw = self.state_obj.gsn_raw
                 aes_key = self.state_obj.active_key
+                video_status = self.state_obj.video_status
+                video_status_level = self.state_obj.video_status_level
                 keys_by_epoch = dict(self.state_obj.keys_by_epoch)
                 kdr_raw_hist = list(self.state_obj.kdr_raw_hist)
                 kdr_corr_hist = list(self.state_obj.kdr_corr_hist)
@@ -395,7 +428,7 @@ class GSNDashboard(tk.Tk):
 
             self._update_key_panel(serial, rssi, noise, gsn_raw, epoch, aes_key)
             self._update_epoch_history(keys_by_epoch)
-            self._update_video(frame, latency)
+            self._update_video(frame, latency, frame_time, aes_key, video_status, video_status_level)
             self._update_kdr_chart(kdr_raw_hist, kdr_corr_hist)
             self._update_latency_chart(lat_hist, rssi_hist)
 
@@ -437,9 +470,26 @@ class GSNDashboard(tk.Tk):
         self.epoch_list.insert("end", "\n".join(lines))
         self.epoch_list.config(state="disabled")
 
-    def _update_video(self, frame, latency):
+    def _update_video(self, frame, latency, frame_time, aes_key, video_status, video_status_level):
+        now = time.time()
         if frame is None:
+            if aes_key is not None:
+                text = "Key synced.\nWaiting for fresh UAV video..."
+                hint = "The key is ready. Waiting for the UAV to send a new decodable frame."
+                level = "warn"
+            else:
+                text = "Waiting for UAV key exchange..."
+                hint = video_status
+                level = video_status_level or "idle"
+            self.video_label.config(image="", text=text)
+            self.video_hint.config(text=hint, style=self._video_hint_style(level))
             return
+
+        if frame_time is not None and now - frame_time > 1.0:
+            self.video_label.config(image="", text="Video stalled.\nWaiting for UAV stream recovery...")
+            self.video_hint.config(text=video_status, style=self._video_hint_style("bad"))
+            return
+
         disp = frame.copy()
         if latency is not None:
             cv2.putText(disp, f"Latency={latency:.1f} ms", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
@@ -452,6 +502,17 @@ class GSNDashboard(tk.Tk):
         img = Image.fromarray(disp)
         self.video_photo = ImageTk.PhotoImage(img)
         self.video_label.config(image=self.video_photo, text="")
+        self.video_hint.config(text=video_status, style=self._video_hint_style(video_status_level))
+
+    @staticmethod
+    def _video_hint_style(level):
+        if level == "good":
+            return "StatusGood.TLabel"
+        if level == "warn":
+            return "StatusWarn.TLabel"
+        if level == "bad":
+            return "StatusBad.TLabel"
+        return "StatusIdle.TLabel"
 
     def _update_kdr_chart(self, raw_hist, corr_hist):
         self.kdr_ax.clear()

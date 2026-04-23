@@ -66,7 +66,7 @@ def keygen_thread():
 def rs_thread(plotter):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", 5007))
-    epoch = 0
+    last_epoch = -1
 
     while True:
         data, _ = sock.recvfrom(65535)
@@ -77,6 +77,12 @@ def rs_thread(plotter):
         epoch   = int(parts[1])
         uav_raw = parts[2]
         parity  = parts[3]
+
+        if last_epoch >= 0 and epoch < last_epoch:
+            with key_lock:
+                keys_by_epoch.clear()
+            print(f"[GSN] UAV key session reset detected: epoch {last_epoch}->{epoch}")
+        last_epoch = epoch
        
         with key_lock:
             local_raw = gsn_raw
@@ -95,7 +101,6 @@ def rs_thread(plotter):
         
 
         plotter.update(uav_raw, local_raw, corrected)
-        epoch += 1
 
 
 # ---------------- Main ----------------

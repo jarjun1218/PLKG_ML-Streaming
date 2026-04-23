@@ -22,6 +22,8 @@ class GSNReceiver:
         self.frames = {}
         self.queue = queue.Queue(maxsize=1)
         self.last_completed_fid = -1
+        self.last_header_fid = -1
+        self.last_header_epoch = -1
 
     def start(self):
         threading.Thread(target=self._recv, daemon=True).start()
@@ -44,6 +46,18 @@ class GSNReceiver:
                 pass
         self.queue.put_nowait(item)
 
+    def _reset_stream_state(self, reason):
+        print(f"[GSNReceiver] stream reset detected: {reason}")
+        self.frames.clear()
+        self.last_completed_fid = -1
+        self.last_header_fid = -1
+        self.last_header_epoch = -1
+        while self.queue.full():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+
     def _recv(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -61,6 +75,19 @@ class GSNReceiver:
 
             if t == b"H":
                 fid, epoch, ts, cnt, _ = struct.unpack("!I I d I 1s", data[1:])
+
+                # UAV reboot/new session: frame_id or epoch rolled back.
+                if (
+                    (self.last_header_epoch >= 0 and epoch < self.last_header_epoch)
+                    or (self.last_header_fid >= 0 and fid + 30 < self.last_header_fid)
+                ):
+                    self._reset_stream_state(
+                        f"epoch {self.last_header_epoch}->{epoch}, fid {self.last_header_fid}->{fid}"
+                    )
+
+                self.last_header_epoch = epoch
+                self.last_header_fid = fid
+
                 if fid <= self.last_completed_fid:
                     continue
                 self.frames[fid] = {
