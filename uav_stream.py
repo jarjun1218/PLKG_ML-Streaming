@@ -16,14 +16,15 @@ class UAVVideoStreamer:
         get_video_key,
         gsn_ip,
         port=5005,
-        chunk=1200,
+        chunk=4096,
         preview=False,
         debug=False,
         window_name="UAV Camera",
         preview_wait=1,
-        resolution=(960, 540),
-        fps=20,
-        jpeg_quality=45,
+        resolution=(640, 360),
+        fps=30,
+        jpeg_quality=40,
+        flip_code=None,
     ):
         """
         get_video_key() -> (epoch, aes_key)
@@ -35,6 +36,7 @@ class UAVVideoStreamer:
         self.resolution = resolution
         self.fps = fps
         self.jpeg_quality = jpeg_quality
+        self.flip_code = flip_code
 
         self.preview = preview
         self.debug = debug
@@ -44,18 +46,17 @@ class UAVVideoStreamer:
         # Keep only the newest frame to avoid queue-backed latency growth.
         self.frame_queue = queue.Queue(maxsize=1)
         self.running = False
-        self.frame_interval = 1.0 / fps if fps > 0 else 0.0
 
     def _producer(self, cam):
         frame_id = 0
         try:
             while self.running:
-                loop_start = time.perf_counter()
                 frame_id += 1
 
                 try:
                     frame = cam.capture_array()
-                    frame = cv2.flip(frame, -1)
+                    if self.flip_code is not None:
+                        frame = cv2.flip(frame, self.flip_code)
                 except Exception as e:
                     print(f"Capture error: {e}")
                     continue
@@ -86,12 +87,6 @@ class UAVVideoStreamer:
                         pass
 
                 self.frame_queue.put((frame_id, jpg_bytes))
-
-                if self.frame_interval > 0:
-                    elapsed = time.perf_counter() - loop_start
-                    sleep_time = self.frame_interval - elapsed
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
 
         except Exception as e:
             print(f"[Producer Error] {e}")
@@ -157,6 +152,7 @@ class UAVVideoStreamer:
         config = cam.create_video_configuration(
             main={"size": self.resolution, "format": "RGB888"},
             buffer_count=2,
+            queue=False,
         )
         cam.configure(config)
         cam.start()

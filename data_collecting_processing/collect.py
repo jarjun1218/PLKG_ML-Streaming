@@ -87,6 +87,11 @@ class CSISerialStreamer:
 
         if self._ser and self._ser.is_open:
             self._ser.close()
+            self._ser = None
+        # clear buffer
+        if self._ser:
+            self._ser.flushInput()
+            self._ser.flushOutput()
 
         if self._file:
             self._file.close()

@@ -36,10 +36,11 @@ CSI_PORT = "/dev/ttyUSB0"
 CSI_BAUD = 115200
 DEBUG = False
 PREVIEW = False
-VIDEO_RESOLUTION = (960, 540)
-VIDEO_FPS = 20
-VIDEO_JPEG_QUALITY = 45
-VIDEO_CHUNK = 1200
+VIDEO_RESOLUTION = (640, 360)
+VIDEO_FPS = 30
+VIDEO_JPEG_QUALITY = 40
+VIDEO_CHUNK = 4096
+VIDEO_FLIP_CODE = None
 
 MODEL_CSI_PATH = "model_reserved/cnn_basic/model_final.pth"
 MODEL_KEY_QUAN_PATH = "model_reserved/cnn_basic_quan/model_final.pth"
@@ -242,6 +243,7 @@ if __name__ == "__main__":
         fps=VIDEO_FPS,
         jpeg_quality=VIDEO_JPEG_QUALITY,
         chunk=VIDEO_CHUNK,
+        flip_code=VIDEO_FLIP_CODE,
     )
 
     print("[UAV] system ready (press q to quit preview)")
