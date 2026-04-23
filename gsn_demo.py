@@ -286,6 +286,7 @@ class GSNDashboard(tk.Tk):
     def _rs_worker(self):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
             sock.bind(("0.0.0.0", 5007))
             with self.state_obj.lock:
                 self.state_obj.rs_started = True
@@ -296,7 +297,7 @@ class GSNDashboard(tk.Tk):
 
         while True:
             try:
-                data, _ = sock.recvfrom(65535)
+                data, _ = sock.recvfrom(1024*1024)
                 parts = data.decode(errors="ignore").split()
                 if len(parts) != 4:
                     continue
@@ -351,7 +352,7 @@ class GSNDashboard(tk.Tk):
 
     def _schedule_updates(self):
         self.after_ids.append(self.after(50, self._drain_log_queue))
-        self.after_ids.append(self.after(33, self._refresh_ui))
+        self.after_ids.append(self.after(10, self._refresh_ui))
 
     def _drain_log_queue(self):
         try:

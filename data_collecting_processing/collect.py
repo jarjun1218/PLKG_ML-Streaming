@@ -100,7 +100,7 @@ class CSISerialStreamer:
         try:
             while not self._stop_event.is_set():
                 # ★ 完全沿用舊版：readline → decode → strip
-                line = self._ser.readline().decode().strip()
+                line = self._ser.readline().decode(errors="ignore").strip()
 
                 # 舊版就是只處理有 serial_num 的行
                 if "serial_num:" not in line:
