@@ -27,7 +27,26 @@ BOOT_PATTERNS = (
 )
 
 
-def connect_serial(port, baudrate):
+def _pulse_esp32_reset(ser, low_s=0.12, boot_s=0.8):
+    """
+    Try to reset ESP32 through USB-UART control lines.
+    Many dev boards wire DTR/RTS to EN/IO0 auto-reset circuitry.
+    """
+    try:
+        ser.dtr = False
+        ser.rts = False
+        time.sleep(0.05)
+        ser.dtr = True
+        ser.rts = False
+        time.sleep(low_s)
+        ser.dtr = False
+        ser.rts = False
+        time.sleep(boot_s)
+    except Exception as exc:
+        print(f"[CSI] ESP32 reset pulse skipped on {ser.port}: {exc}")
+
+
+def connect_serial(port, baudrate, reset_on_connect=True, reboot_cooldown=1.5):
     """Open serial port with conservative settings for long-running CSI reads."""
     ser = serial.Serial(
         port=port,
@@ -35,11 +54,14 @@ def connect_serial(port, baudrate):
         timeout=1,
         write_timeout=1,
         inter_byte_timeout=0.1,
-        exclusive=False,
     )
 
+    if reset_on_connect:
+        print(f"[CSI] Resetting ESP32 on {port} after new serial connection.")
+        _pulse_esp32_reset(ser)
+
     # Avoid consuming stale bytes left in the adapter / device buffer.
-    time.sleep(0.2)
+    time.sleep(max(0.2, reboot_cooldown))
     try:
         ser.reset_input_buffer()
         ser.reset_output_buffer()
@@ -85,6 +107,7 @@ class CSISerialStreamer:
         callback=None,
         reboot_cooldown=1.5,
         reconnect_delay=1.0,
+        reset_on_connect=True,
     ):
         self.port = port
         self.baudrate = baudrate
@@ -93,6 +116,7 @@ class CSISerialStreamer:
         self.callback = callback
         self.reboot_cooldown = reboot_cooldown
         self.reconnect_delay = reconnect_delay
+        self.reset_on_connect = reset_on_connect
 
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -100,6 +124,7 @@ class CSISerialStreamer:
         self._file = None
         self._last_serial = None
         self._discard_until = 0.0
+        self._serial_lock = threading.Lock()
 
     def start(self):
         self._stop_event.clear()
@@ -125,29 +150,46 @@ class CSISerialStreamer:
             self._file.close()
             self._file = None
 
+    def restart(self):
+        self.stop()
+        self.start()
+
     def _ensure_serial(self):
-        if self._ser is not None and self._ser.is_open:
-            return
-        self._ser = connect_serial(self.port, self.baudrate)
-        self._last_serial = None
-        self._discard_until = time.time() + self.reboot_cooldown
-        print(f"[CSI] Serial connected: {self.port} @ {self.baudrate}")
+        with self._serial_lock:
+            if self._ser is not None and self._ser.is_open:
+                return
+            self._ser = connect_serial(
+                self.port,
+                self.baudrate,
+                reset_on_connect=self.reset_on_connect,
+                reboot_cooldown=self.reboot_cooldown,
+            )
+            self._last_serial = None
+            self._discard_until = time.time() + self.reboot_cooldown
+            print(f"[CSI] Serial connected: {self.port} @ {self.baudrate}")
 
     def _close_serial(self):
-        ser = self._ser
-        self._ser = None
-        if not ser:
-            return
-        try:
-            if ser.is_open:
-                try:
-                    ser.reset_input_buffer()
-                    ser.reset_output_buffer()
-                except Exception:
-                    pass
-                ser.close()
-        except Exception:
-            pass
+        with self._serial_lock:
+            ser = self._ser
+            self._ser = None
+            if not ser:
+                return
+            try:
+                if ser.is_open:
+                    try:
+                        ser.reset_input_buffer()
+                        ser.reset_output_buffer()
+                    except Exception:
+                        pass
+                    ser.close()
+            except Exception:
+                pass
+
+    def force_reset(self):
+        print(f"[CSI] Force reset requested on {self.port}")
+        self._close_serial()
+        self._last_serial = None
+        self._discard_until = time.time() + self.reboot_cooldown
 
     def _trigger_reboot_recovery(self, reason):
         print(f"[CSI] Reset/noise detected on {self.port}: {reason}")
@@ -218,7 +260,11 @@ class CSISerialStreamer:
         while not self._stop_event.is_set():
             try:
                 self._ensure_serial()
-                raw = self._ser.readline()
+                with self._serial_lock:
+                    if self._ser is None:
+                        raw = b""
+                    else:
+                        raw = self._ser.readline()
                 if not raw:
                     continue
 
@@ -258,6 +304,7 @@ def build_argparser():
     parser.add_argument("--baudrate", type=int, default=115200, help="Serial baudrate")
     parser.add_argument("--endpoint-type", default="GSN", help="Endpoint tag for file naming")
     parser.add_argument("--disable-file", action="store_true", help="Do not write raw data to disk")
+    parser.add_argument("--no-reset-on-connect", action="store_true", help="Do not reset ESP32 when the serial connection is opened")
     return parser
 
 
@@ -268,6 +315,7 @@ def main():
         args.baudrate,
         args.endpoint_type,
         write_file=not args.disable_file,
+        reset_on_connect=not args.no_reset_on_connect,
     )
     streamer.start()
     print("[CSI] Press Ctrl+C to stop collecting.")

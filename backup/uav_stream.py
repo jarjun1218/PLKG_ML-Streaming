@@ -1,3 +1,4 @@
+import io
 import os
 import queue
 import socket
@@ -11,42 +12,33 @@ from picamera2 import Picamera2
 from time_sync import estimate_clock_offset
 
 try:
-    from picamera2.encoders import H264Encoder
-    from picamera2.outputs import Output
+    from picamera2.encoders import MJPEGEncoder
+    from picamera2.outputs import FileOutput
 except Exception:
-    H264Encoder = None
-    Output = object
+    MJPEGEncoder = None
+    FileOutput = None
 
 cv2.setNumThreads(1)
 
-VIDEO_HEADER_PACKET = struct.Struct("!I I d I 1s ?")
-VIDEO_PAYLOAD_PACKET = struct.Struct("!I I")
-CODEC_H264 = b"4"
-CODEC_JPEG = b"J"
 
+class LatestEncodedFrameBuffer(io.BufferedIOBase):
+    """Keep only the newest encoded frame from Picamera2's encoder output."""
 
-class LatestEncodedAccessUnitBuffer(Output):
-    """Keep only the newest encoded access unit from the hardware encoder."""
-
-    def __init__(self, codec_tag):
-        super().__init__()
+    def __init__(self):
         self._lock = threading.Lock()
         self._latest = None
         self._seq = 0
-        self.codec_tag = codec_tag
 
-    def outputframe(self, frame, keyframe=True, timestamp=None, packet=None, audio=False):
-        if audio or not frame:
-            return
+    def write(self, data):
+        if not data:
+            return 0
         with self._lock:
             self._seq += 1
-            self._latest = (
-                self._seq,
-                time.time(),
-                bytes(frame),
-                bool(keyframe),
-                self.codec_tag,
-            )
+            self._latest = (self._seq, time.time(), bytes(data))
+        return len(data)
+
+    def writable(self):
+        return True
 
     def get_latest(self, last_seq):
         with self._lock:
@@ -55,6 +47,9 @@ class LatestEncodedAccessUnitBuffer(Output):
             if self._latest[0] == last_seq:
                 return None
             return self._latest
+
+    def flush(self):
+        return None
 
 
 class UAVVideoStreamer:
@@ -70,13 +65,11 @@ class UAVVideoStreamer:
         preview_wait=1,
         resolution=(640, 360),
         fps=30,
-        h264_bitrate=4_000_000,
-        h264_iperiod=None,
         jpeg_quality=40,
         flip_code=None,
         fixed_exposure_us=12000,
         analogue_gain=1.0,
-        use_hardware_h264=True,
+        use_hardware_mjpeg=True,
         sync_port=5006,
         sync_samples=8,
         sync_retry_interval=1.0,
@@ -92,13 +85,11 @@ class UAVVideoStreamer:
         self.chunk = chunk
         self.resolution = resolution
         self.fps = fps
-        self.h264_bitrate = h264_bitrate
-        self.h264_iperiod = h264_iperiod
         self.jpeg_quality = jpeg_quality
         self.flip_code = flip_code
         self.fixed_exposure_us = fixed_exposure_us
         self.analogue_gain = analogue_gain
-        self.use_hardware_h264 = use_hardware_h264
+        self.use_hardware_mjpeg = use_hardware_mjpeg
         self.sync_port = sync_port
         self.sync_samples = sync_samples
         self.sync_retry_interval = sync_retry_interval
@@ -208,12 +199,12 @@ class UAVVideoStreamer:
                 self.stats = self._make_stats_bucket()
 
             fps_in = frames_available / elapsed
-            avg_payload_kb = (jpeg_bytes_sent / frames_sent / 1024.0) if frames_sent else 0.0
+            avg_jpeg_kb = (jpeg_bytes_sent / frames_sent / 1024.0) if frames_sent else 0.0
             avg_chunks = (chunks_sent / frames_sent) if frames_sent else 0.0
             mbps = (wire_bytes_sent * 8.0) / elapsed / 1_000_000.0
             clock_offset_ms = self._get_clock_offset() * 1000.0
             capture_ms = (capture_time_s * 1000.0 / frames_captured) if frames_captured else 0.0
-            software_encode_ms = (jpeg_encode_time_s * 1000.0 / frames_available) if frames_available else 0.0
+            jpeg_ms = (jpeg_encode_time_s * 1000.0 / frames_available) if frames_available else 0.0
             encrypt_ms = (encrypt_time_s * 1000.0 / frames_sent) if frames_sent else 0.0
             send_ms = (send_time_s * 1000.0 / frames_sent) if frames_sent else 0.0
             queue_ms = (pre_send_queue_time_s * 1000.0 / frames_sent) if frames_sent else 0.0
@@ -224,10 +215,10 @@ class UAVVideoStreamer:
                 f"fps_out={frames_sent / elapsed:.1f} "
                 f"pkts/s={packets_sent / elapsed:.1f} "
                 f"mbps={mbps:.2f} "
-                f"avg_payload_kb={avg_payload_kb:.1f} "
+                f"avg_jpeg_kb={avg_jpeg_kb:.1f} "
                 f"avg_chunks={avg_chunks:.1f} "
                 f"cap_ms={capture_ms:.1f} "
-                f"swenc_ms={software_encode_ms:.1f} "
+                f"jpg_ms={jpeg_ms:.1f} "
                 f"enc_ms={encrypt_ms:.1f} "
                 f"send_ms={send_ms:.1f} "
                 f"queue_ms={queue_ms:.1f} "
@@ -301,30 +292,23 @@ class UAVVideoStreamer:
         except Exception as e:
             print(f"[Cam Warning] {e}")
 
-    def _send_encoded_bytes(self, sock, frame_id, ts, encoded_bytes, aes_cipher, epoch, codec_tag, keyframe):
+    def _send_jpeg_bytes(self, sock, frame_id, ts, jpg_bytes, aes_cipher, epoch):
         corrected_ts = ts + self._get_clock_offset()
         nonce = os.urandom(12)
         encrypt_start = time.perf_counter()
-        encrypted = nonce + aes_cipher.encrypt(nonce, encoded_bytes, None)
+        encrypted = nonce + aes_cipher.encrypt(nonce, jpg_bytes, None)
         encrypt_time_s = time.perf_counter() - encrypt_start
         chunks = [
             encrypted[i : i + self.chunk]
             for i in range(0, len(encrypted), self.chunk)
         ]
 
-        header = b"H" + VIDEO_HEADER_PACKET.pack(
-            frame_id,
-            epoch,
-            corrected_ts,
-            len(chunks),
-            codec_tag,
-            bool(keyframe),
-        )
+        header = b"H" + struct.pack("!I I d I 1s", frame_id, epoch, corrected_ts, len(chunks), b"A")
         send_start = time.perf_counter()
         sock.sendto(header, (self.gsn_ip, self.port))
 
         for idx, ch in enumerate(chunks):
-            pkt = b"P" + VIDEO_PAYLOAD_PACKET.pack(frame_id, idx) + ch
+            pkt = b"P" + struct.pack("!I I", frame_id, idx) + ch
             sock.sendto(pkt, (self.gsn_ip, self.port))
         send_time_s = time.perf_counter() - send_start
         pre_send_queue_time_s = max(0.0, time.time() - ts)
@@ -333,7 +317,7 @@ class UAVVideoStreamer:
             frames_sent=1,
             packets_sent=1 + len(chunks),
             wire_bytes_sent=len(header) + sum(9 + len(ch) for ch in chunks),
-            jpeg_bytes_sent=len(encoded_bytes),
+            jpeg_bytes_sent=len(jpg_bytes),
             chunks_sent=len(chunks),
             encrypt_time_s=encrypt_time_s,
             send_time_s=send_time_s,
@@ -428,16 +412,7 @@ class UAVVideoStreamer:
                     aes_cipher = AESGCM(aes_key)
                     last_epoch = epoch
 
-                self._send_encoded_bytes(
-                    sock,
-                    frame_id,
-                    capture_ts,
-                    jpg.tobytes(),
-                    aes_cipher,
-                    epoch,
-                    CODEC_JPEG,
-                    True,
-                )
+                self._send_jpeg_bytes(sock, frame_id, capture_ts, jpg.tobytes(), aes_cipher, epoch)
 
         except Exception as e:
             print(f"[Consumer Error] {e}")
@@ -456,7 +431,7 @@ class UAVVideoStreamer:
                     time.sleep(0.001)
                     continue
 
-                seq, encoded_ts, encoded_bytes, keyframe, codec_tag = latest
+                seq, encoded_ts, jpg_bytes = latest
                 self._record_stats(frames_available=1)
                 if last_seq and seq > last_seq + 1:
                     self._record_stats(encoder_skips=seq - last_seq - 1)
@@ -472,16 +447,7 @@ class UAVVideoStreamer:
                     aes_cipher = AESGCM(aes_key)
                     last_epoch = epoch
 
-                self._send_encoded_bytes(
-                    sock,
-                    frame_id,
-                    encoded_ts,
-                    encoded_bytes,
-                    aes_cipher,
-                    epoch,
-                    codec_tag,
-                    keyframe,
-                )
+                self._send_jpeg_bytes(sock, frame_id, encoded_ts, jpg_bytes, aes_cipher, epoch)
 
         except Exception as e:
             print(f"[HW Consumer Error] {e}")
@@ -505,7 +471,7 @@ class UAVVideoStreamer:
                 time.sleep(0.05)
 
     def _run_hardware(self, sock):
-        if not self.use_hardware_h264 or H264Encoder is None:
+        if not self.use_hardware_mjpeg or MJPEGEncoder is None or FileOutput is None:
             return False
 
         cam = None
@@ -526,14 +492,10 @@ class UAVVideoStreamer:
             cam.configure(cam.create_video_configuration(**config_kwargs))
             self._apply_camera_controls(cam)
 
-            encoded_output = LatestEncodedAccessUnitBuffer(CODEC_H264)
-            encoder = H264Encoder(
-                bitrate=self.h264_bitrate,
-                repeat=True,
-                iperiod=self.h264_iperiod or max(1, int(self.fps)),
-            )
+            encoded_output = LatestEncodedFrameBuffer()
+            encoder = MJPEGEncoder()
 
-            cam.start_encoder(encoder, encoded_output)
+            cam.start_encoder(encoder, FileOutput(encoded_output))
             cam.start()
 
             self.running = True
@@ -548,8 +510,7 @@ class UAVVideoStreamer:
                 preview_thread.start()
 
             print(
-                f"[UAV] hardware H.264 stream started: {self.resolution} @ {self.fps}fps, "
-                f"bitrate={self.h264_bitrate}, iperiod={self.h264_iperiod or max(1, int(self.fps))}, "
+                f"[UAV] hardware MJPEG stream started: {self.resolution} @ {self.fps}fps, "
                 f"chunk={self.chunk}, fixed_exposure={self.fixed_exposure_us}, "
                 f"analogue_gain={self.analogue_gain}"
             )
@@ -560,7 +521,7 @@ class UAVVideoStreamer:
             return True
 
         except Exception as e:
-            print(f"[UAV] hardware H.264 unavailable, falling back to software JPEG: {e}")
+            print(f"[UAV] hardware MJPEG unavailable, falling back to software JPEG: {e}")
             self.running = False
             try:
                 if cam is not None:

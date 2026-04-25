@@ -10,41 +10,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from time_sync import ClockSyncServer
 
-try:
-    import av
-except Exception:
-    av = None
-
-
-VIDEO_HEADER_PACKET = struct.Struct("!I I d I 1s ?")
-VIDEO_PAYLOAD_PACKET = struct.Struct("!I I")
-CODEC_H264 = b"4"
-CODEC_JPEG = b"J"
-
-
-class H264AccessUnitDecoder:
-    def __init__(self):
-        if av is None:
-            raise RuntimeError(
-                "PyAV (`av`) is required on the GSN side for H.264 video decoding."
-            )
-        self._codec = None
-        self.reset()
-
-    def reset(self):
-        self._codec = av.CodecContext.create("h264", "r")
-        self._codec.thread_count = 0
-
-    def decode(self, data):
-        packets = self._codec.parse(data)
-        if not packets:
-            packets = self._codec.parse(b"")
-
-        frames = []
-        for packet in packets:
-            frames.extend(self._codec.decode(packet))
-        return frames
-
 
 class GSNReceiver:
     def __init__(
@@ -54,7 +19,6 @@ class GSNReceiver:
         video_port=5005,
         frame_timeout=0.4,
         sync_port=5006,
-        decode_queue_size=32,
     ):
         """
         get_aes_key(epoch) -> bytes
@@ -66,14 +30,11 @@ class GSNReceiver:
         self.frame_timeout = frame_timeout
         self.sync_port = sync_port
         self.frames = {}
-        self.queue = queue.Queue(maxsize=decode_queue_size)
+        self.queue = queue.Queue(maxsize=1)
         self.last_completed_fid = -1
         self.last_header_fid = -1
         self.last_header_epoch = -1
         self.clock_sync_server = ClockSyncServer(port=self.sync_port)
-        self.h264_decoder = H264AccessUnitDecoder() if av is not None else None
-        self.need_h264_keyframe = threading.Event()
-        self.warned_h264_missing = False
 
     def start(self):
         self.clock_sync_server.start()
@@ -86,8 +47,6 @@ class GSNReceiver:
             for fid, info in self.frames.items()
             if now - info["created_at"] > self.frame_timeout
         ]
-        if stale:
-            self.need_h264_keyframe.set()
         for fid in stale:
             self.frames.pop(fid, None)
 
@@ -95,7 +54,6 @@ class GSNReceiver:
         if self.queue.full():
             try:
                 self.queue.get_nowait()
-                self.need_h264_keyframe.set()
             except queue.Empty:
                 pass
         self.queue.put_nowait(item)
@@ -106,10 +64,7 @@ class GSNReceiver:
         self.last_completed_fid = -1
         self.last_header_fid = -1
         self.last_header_epoch = -1
-        self.need_h264_keyframe.set()
-        if self.h264_decoder is not None:
-            self.h264_decoder.reset()
-        while not self.queue.empty():
+        while self.queue.full():
             try:
                 self.queue.get_nowait()
             except queue.Empty:
@@ -131,7 +86,7 @@ class GSNReceiver:
             t = data[0:1]
 
             if t == b"H":
-                fid, epoch, ts, cnt, codec_tag, keyframe = VIDEO_HEADER_PACKET.unpack(data[1:])
+                fid, epoch, ts, cnt, _ = struct.unpack("!I I d I 1s", data[1:])
 
                 # UAV reboot/new session: frame_id or epoch rolled back.
                 if (
@@ -150,15 +105,13 @@ class GSNReceiver:
                 self.frames[fid] = {
                     "epoch": epoch,
                     "ts": ts,
-                    "codec": codec_tag,
-                    "keyframe": keyframe,
                     "pkts": {},
                     "max": cnt,
                     "created_at": now,
                 }
 
             elif t == b"P":
-                fid, pid = VIDEO_PAYLOAD_PACKET.unpack(data[1:9])
+                fid, pid = struct.unpack("!I I", data[1:9])
                 info = self.frames.get(fid)
                 if info is None:
                     continue
@@ -168,20 +121,10 @@ class GSNReceiver:
                     try:
                         blob = b"".join(info["pkts"][i] for i in range(info["max"]))
                     except KeyError:
-                        self.need_h264_keyframe.set()
                         self.frames.pop(fid, None)
                         continue
 
-                    self._push_latest(
-                        (
-                            fid,
-                            info["epoch"],
-                            info["ts"],
-                            info["codec"],
-                            info["keyframe"],
-                            blob,
-                        )
-                    )
+                    self._push_latest((fid, info["epoch"], info["ts"], blob))
                     self.last_completed_fid = max(self.last_completed_fid, fid)
                     self.frames.pop(fid, None)
 
@@ -189,43 +132,19 @@ class GSNReceiver:
                     for old_fid in old_fids:
                         self.frames.pop(old_fid, None)
 
-    def _decode_payload(self, codec_tag, keyframe, payload):
-        if codec_tag == CODEC_JPEG:
-            return cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
-
-        if codec_tag != CODEC_H264:
-            return None
-
-        if self.h264_decoder is None:
-            if not self.warned_h264_missing:
-                print("[GSNReceiver] missing PyAV (`av`) dependency; cannot decode H.264 stream.")
-                self.warned_h264_missing = True
-            return None
-
-        if self.need_h264_keyframe.is_set():
-            if not keyframe:
-                return None
-            self.h264_decoder.reset()
-            self.need_h264_keyframe.clear()
-
-        try:
-            frames = self.h264_decoder.decode(payload)
-        except Exception as exc:
-            self.need_h264_keyframe.set()
-            print(f"[GSNReceiver] H.264 decode error, waiting for next keyframe: {exc}")
-            return None
-
-        if not frames:
-            return None
-
-        return frames[-1].to_ndarray(format="bgr24")
-
     def _show(self):
         last_epoch = None
         aes_cipher = None
 
         while True:
-            _, epoch, ts, codec_tag, keyframe, blob = self.queue.get()
+            _, epoch, ts, blob = self.queue.get()
+
+            # Prefer the newest completed frame if the decoder briefly lags.
+            while True:
+                try:
+                    _, epoch, ts, blob = self.queue.get_nowait()
+                except queue.Empty:
+                    break
 
             key = self.get_aes_key(epoch)
             if key is None:
@@ -234,15 +153,14 @@ class GSNReceiver:
             if epoch != last_epoch or aes_cipher is None:
                 aes_cipher = AESGCM(key)
                 last_epoch = epoch
-                self.need_h264_keyframe.set()
 
             nonce, cipher = blob[:12], blob[12:]
             try:
-                payload = aes_cipher.decrypt(nonce, cipher, None)
+                jpg = aes_cipher.decrypt(nonce, cipher, None)
             except Exception:
                 continue
 
-            frame = self._decode_payload(codec_tag, keyframe, payload)
+            frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
                 continue
 
