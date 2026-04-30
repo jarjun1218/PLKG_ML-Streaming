@@ -5,8 +5,8 @@ uav_main.py (FINAL with CNN-Q)
 Pipeline:
 1. CSI -> CNN (cnn_basic) -> raw key (102-bit)
 2. raw key -> CNN-Q -> key_uav'
-3. key_uav' -> RS parity -> send (epoch, CSI serial, parity)
-4. GSN corrects its local quantized key using the parity
+3. key_uav' -> BCH syndrome helper -> send (epoch, CSI serial, helper)
+4. GSN corrects its local quantized key using the BCH helper
 5. key_uav'/corrected key -> SHA256 -> AES key (key_uav'')
 6. AES key -> HMAC key confirmation
 7. AES-GCM(key_uav'') encrypt video -> send (epoch)
@@ -26,7 +26,7 @@ from key_confirm import make_key_confirm
 from models.cnn_basic import cnn_basic
 torch.serialization.add_safe_globals([cnn_basic])
 
-from rs_ecc import rs_encode_parity_b64, force_102_bits
+from bch_reconciliation import bch_encode_syndrome_b64, force_102_bits
 
 from uav_sender import UAVKeySender
 from uav_stream import UAVVideoStreamer
@@ -40,7 +40,7 @@ CSI_PORT = "/dev/ttyUSB0"
 CSI_BAUD = 115200
 DEBUG = False
 PREVIEW = False
-VIDEO_RESOLUTION = (960, 720)
+VIDEO_RESOLUTION = (960, 540)
 VIDEO_FPS = 15
 VIDEO_H264_BITRATE = 8_000_000
 VIDEO_H264_IPERIOD = 15
@@ -68,21 +68,29 @@ class KeyState:
         self.lock = threading.Lock()
         self.epoch = -1
         self.serial = None         # CSI serial used for this key
-        self.parity = None         # RS parity (base64)
+        self.helper = None         # BCH syndrome helper (base64)
         self.confirm = None        # HMAC confirmation tag (hex)
         self.aes_key = None        # AES key (bytes)
 
-    def update(self, serial, parity, aes_key):
+    def update(self, serial, helper, aes_key):
         with self.lock:
             self.epoch += 1
             self.serial = serial
-            self.parity = parity
-            self.confirm = make_key_confirm(aes_key, self.epoch, serial, parity)
+            self.helper = helper
+            self.confirm = make_key_confirm(aes_key, self.epoch, serial, helper)
             self.aes_key = aes_key
+
+    def invalidate(self):
+        with self.lock:
+            self.epoch = -1
+            self.serial = None
+            self.helper = None
+            self.confirm = None
+            self.aes_key = None
 
     def for_reconciliation(self):
         with self.lock:
-            return self.epoch, self.serial, self.parity, self.confirm
+            return self.epoch, self.serial, self.helper, self.confirm
 
     def for_video(self):
         with self.lock:
@@ -91,6 +99,7 @@ class KeyState:
 
 key_state = KeyState()
 uav_csi_watcher = None
+keygen_resync_event = threading.Event()
 
 
 # ======================================================
@@ -188,7 +197,7 @@ def reconstruct_key_cnnq(model_q, raw_bits: str, debug: bool = False) -> str:
     return "".join(str(int(b)) for b in bits)
 
 # ======================================================
-# THREAD 1: Key generation + CNN-Q + RS
+# THREAD 1: Key generation + CNN-Q + BCH
 # ======================================================
 def keygen_thread():
     global uav_csi_watcher
@@ -208,6 +217,12 @@ def keygen_thread():
     print("[UAV] keygen (with CNN-Q) started")
 
     while True:
+        if keygen_resync_event.is_set():
+            keygen_resync_event.clear()
+            last_serial = None
+            next_keygen_time = 0.0
+            print("[UAV] keygen resync requested; waiting for fresh CSI")
+
         s = watcher.snapshot().get("UAV")
         if not s:
             time.sleep(0.05)
@@ -239,14 +254,14 @@ def keygen_thread():
         # === Step 2: CNN-Q reconstruction ===
         key_uav_p = reconstruct_key_cnnq(model_q, raw_key, debug=DEBUG)
 
-        # === Step 3: RS parity helper for reconciliation ===
-        parity = rs_encode_parity_b64(key_uav_p)
+        # === Step 3: BCH syndrome helper for reconciliation ===
+        helper = bch_encode_syndrome_b64(key_uav_p)
 
         # === Step 5: privacy amplification / AES-256 key ===
         aes_key = sha256.sha_byte(key_uav_p)
 
         # === Step 6: key confirmation tag ===
-        key_state.update(s["serial"], parity, aes_key)
+        key_state.update(s["serial"], helper, aes_key)
         next_keygen_time = time.monotonic() + KEY_UPDATE_INTERVAL_SEC
         print(
             f"[UAV] new key epoch={key_state.epoch} "
@@ -266,12 +281,16 @@ def control_thread():
             continue
 
         print(f"[UAV] received RESET_CSI from {addr[0]}")
+        key_state.invalidate()
+        keygen_resync_event.set()
         watcher = uav_csi_watcher
         if watcher is None:
+            print("[UAV] invalidated active key; CSI watcher is not ready yet")
             continue
 
         try:
             watcher.force_reset()
+            print("[UAV] invalidated active key after RESET_CSI")
         except Exception as exc:
             print(f"[UAV] failed to reset CSI streamer: {exc}")
 
@@ -284,7 +303,7 @@ if __name__ == "__main__":
     threading.Thread(target=keygen_thread, daemon=True).start()
     threading.Thread(target=control_thread, daemon=True).start()
 
-    # Parity sender
+    # Reconciliation helper sender
     sender = UAVKeySender(key_state.for_reconciliation, GSN_IP, debug=DEBUG)
     threading.Thread(target=sender.run, daemon=True).start()
 

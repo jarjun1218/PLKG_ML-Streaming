@@ -1,5 +1,6 @@
 ﻿import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+import argparse
 
 import threading
 import time
@@ -20,7 +21,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import sha256
 from csi_control import send_csi_reset_request
 from key_confirm import verify_key_confirm
-from rs_ecc import rs_decode_key
+from bch_reconciliation import bch_decode_key
 from gsn_key_generate import load_model, CSISerialWatcher, generate_key
 from gsn_receiver import GSNReceiver
 
@@ -30,7 +31,24 @@ VIDEO_VIEWPORT_MAX_W = 1920
 VIDEO_VIEWPORT_MAX_H = 1440
 VIDEO_VIEWPORT_MIN_W = 480
 VIDEO_VIEWPORT_MIN_H = 360
-VIDEO_VIEWPORT_ASPECT = 4 / 3
+VIDEO_VIEWPORT_ASPECT = 16 / 9
+
+APP_BG = "#09111f"
+SURFACE_BG = "#0f172a"
+CARD_BG = "#111c30"
+CARD_BG_ALT = "#0c1526"
+CARD_BORDER = "#24324a"
+CARD_BORDER_SOFT = "#1b2940"
+TITLE_BG = "#0a1222"
+TEXT_MAIN = "#eef4ff"
+TEXT_MUTED = "#8fa2c2"
+TEXT_SOFT = "#6f83a6"
+ACCENT_BLUE = "#57b4ff"
+ACCENT_TEAL = "#3dd7c4"
+ACCENT_AMBER = "#ffbf5a"
+ACCENT_PINK = "#f472b6"
+ACCENT_GREEN = "#4ade80"
+ACCENT_VIOLET = "#9b8cff"
 
 
 @dataclass
@@ -40,7 +58,7 @@ class GSNState:
     model_loaded: bool = False
     serial_connected: bool = False
     receiver_started: bool = False
-    rs_started: bool = False
+    bch_started: bool = False
 
     gsn_raw: str | None = None
     gsn_raw_by_serial: dict = field(default_factory=dict)
@@ -74,18 +92,20 @@ class GSNState:
 
 class PanelHost(tk.Frame):
     def __init__(self, parent, name, placeholder):
-        super().__init__(parent, bg="#0f172a", highlightthickness=0, bd=0)
+        super().__init__(parent, bg=SURFACE_BG, highlightthickness=0, bd=0, padx=8, pady=8)
         self.name = name
         self.placeholder_text = placeholder
         self.panels = []
-        self.stack = tk.Frame(self, bg="#0f172a", highlightthickness=0, bd=0)
+        self.stack = tk.Frame(self, bg=SURFACE_BG, highlightthickness=0, bd=0)
         self.stack.pack(fill="both", expand=True)
         self.placeholder = tk.Label(
             self.stack,
             text=self.placeholder_text,
-            bg="#0f172a",
-            fg="#64748b",
+            bg=CARD_BG_ALT,
+            fg=TEXT_MUTED,
             font=("Arial", 10, "italic"),
+            highlightthickness=1,
+            highlightbackground=CARD_BORDER_SOFT,
         )
         self.placeholder.pack(fill="both", expand=True, padx=8, pady=8)
         self._tag_host_widgets()
@@ -113,7 +133,7 @@ class PanelHost(tk.Frame):
             self.placeholder.pack(fill="both", expand=True, padx=8, pady=8)
 
     def set_drop_highlight(self, active):
-        self.configure(highlightthickness=1 if active else 0, highlightbackground="#64748b")
+        self.configure(highlightthickness=1 if active else 0, highlightbackground=ACCENT_BLUE)
 
 
 class BasePanel:
@@ -135,16 +155,16 @@ class BasePanel:
         self.last_host_name = host.name
         host.add_panel(self)
 
-        self.card = tk.Frame(host.stack, bg="#111827", highlightthickness=1, highlightbackground="#1f2937", bd=0)
+        self.card = tk.Frame(host.stack, bg=CARD_BG, highlightthickness=1, highlightbackground=CARD_BORDER, bd=0)
         self.card.pack(fill="both", expand=True, padx=4, pady=4)
-        titlebar = tk.Frame(self.card, bg="#0b1220", height=30)
+        titlebar = tk.Frame(self.card, bg=TITLE_BG, height=30)
         titlebar.pack(fill="x")
         titlebar.pack_propagate(False)
-        grip = tk.Label(titlebar, text="::", bg="#0b1220", fg="#64748b", font=("Consolas", 11, "bold"))
+        grip = tk.Label(titlebar, text="::", bg=TITLE_BG, fg=TEXT_SOFT, font=("Consolas", 11, "bold"))
         grip.pack(side="left", padx=(8, 4))
-        label = tk.Label(titlebar, text=self.title, bg="#0b1220", fg="#e5e7eb", font=("Arial", 11, "bold"))
+        label = tk.Label(titlebar, text=self.title, bg=TITLE_BG, fg=TEXT_MAIN, font=("Arial", 11, "bold"))
         label.pack(side="left", padx=(0, 8))
-        self.body = tk.Frame(self.card, bg="#111827")
+        self.body = tk.Frame(self.card, bg=CARD_BG)
         self.body.pack(fill="both", expand=True)
 
         for widget in (titlebar, grip, label):
@@ -195,15 +215,17 @@ class ModulePanel(BasePanel):
         self.last_host_name = host.name
         host.add_panel(self)
 
-        self.card = tk.Frame(host.stack, bg="#111827", highlightthickness=1, highlightbackground="#1f2937", bd=0)
-        self.card.pack(fill="both", expand=True, padx=4, pady=4)
-        titlebar = tk.Frame(self.card, bg="#0b1220", height=32)
+        self.card = tk.Frame(host.stack, bg=CARD_BG, highlightthickness=1, highlightbackground=CARD_BORDER, bd=0)
+        self.card.pack(fill="both", expand=True, padx=6, pady=6)
+        titlebar = tk.Frame(self.card, bg=TITLE_BG, height=34)
         titlebar.pack(fill="x")
         titlebar.pack_propagate(False)
-        grip = tk.Label(titlebar, text="::", bg="#0b1220", fg="#64748b", font=("Consolas", 11, "bold"))
-        grip.pack(side="left", padx=(8, 4))
-        label = tk.Label(titlebar, text=self.title, bg="#0b1220", fg="#e5e7eb", font=("Arial", 11, "bold"))
-        label.pack(side="left", padx=(0, 8))
+        accent = tk.Frame(titlebar, bg=ACCENT_BLUE, width=3)
+        accent.pack(side="left", fill="y", padx=(0, 8))
+        grip = tk.Label(titlebar, text="::", bg=TITLE_BG, fg=TEXT_SOFT, font=("Consolas", 12, "bold"))
+        grip.pack(side="left", padx=(0, 7))
+        label = tk.Label(titlebar, text=self.title, bg=TITLE_BG, fg=TEXT_MAIN, font=("Arial", 11, "bold"))
+        label.pack(side="left", fill="x", expand=True, padx=(0, 8))
         if len(self.content_options) > 1:
             self.content_var = tk.StringVar(value=self.content_options[self.content_key])
             selector = ttk.Combobox(
@@ -212,17 +234,19 @@ class ModulePanel(BasePanel):
                 width=18,
                 values=list(self.content_options.values()),
                 textvariable=self.content_var,
+                style="Panel.TCombobox",
             )
-            selector.pack(side="right", padx=8, pady=4)
+            selector.pack(side="right", padx=10, pady=5)
             selector.bind("<<ComboboxSelected>>", self._on_content_change)
             self.selector = selector
         else:
             self.content_var = None
             self.selector = None
-            ttk.Label(titlebar, text=self.content_options[self.content_key], style="Muted.TLabel").pack(side="right", padx=8)
+            tk.Label(titlebar, text=self.content_options[self.content_key], bg=TITLE_BG, fg=TEXT_MUTED, font=("Arial", 9, "bold")).pack(side="right", padx=10)
 
-        self.body = tk.Frame(self.card, bg="#111827")
+        self.body = tk.Frame(self.card, bg=CARD_BG)
         self.body.pack(fill="both", expand=True)
+        tk.Frame(self.card, bg=CARD_BORDER_SOFT, height=1).pack(fill="x")
 
         for widget in (titlebar, grip, label):
             self.dashboard.bind_panel_drag(self, widget)
@@ -244,7 +268,7 @@ class ModulePanel(BasePanel):
 
 
 class VideoModulePanel(ModulePanel):
-    def __init__(self, dashboard, key="media_main", title="Media Panel", default_content="video"):
+    def __init__(self, dashboard, key="media_main", title="Decrypted Video", default_content="video"):
         super().__init__(dashboard, key, title, {"video": "Decrypted Video"}, default_content)
         self.video_photo = None
         self.viewport_size = (VIDEO_VIEWPORT_MAX_W, VIDEO_VIEWPORT_MAX_H)
@@ -499,29 +523,22 @@ class ChartModulePanel(ModulePanel):
 
 
 class ControlModulePanel(ModulePanel):
-    CONTROL_OPTIONS = {"session": "Session Controls"}
+    CONTROL_OPTIONS = {"session": "Runtime State"}
 
-    def __init__(self, dashboard, key="control_panel", title="Control Panel", default_content="session"):
+    def __init__(self, dashboard, key="control_panel", title="System State", default_content="session"):
         super().__init__(dashboard, key, title, self.CONTROL_OPTIONS, default_content)
 
     def build_body(self, parent):
-        actions = tk.Frame(parent, bg="#111827")
-        actions.pack(fill="x", padx=10, pady=(10, 8))
-        ttk.Button(actions, text="Start Backend", command=self.dashboard.start_backend).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Pause / Resume UI", command=self.dashboard.toggle_pause).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Clear Log", command=self.dashboard.clear_log).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Reset Layout", command=self.dashboard.reset_layout).pack(side="left")
-
         self.summary = tk.Text(
             parent,
-            height=6,
+            height=5,
             wrap="word",
             bg="#020617",
             fg="#e2e8f0",
             insertbackground="#e2e8f0",
             relief="flat",
         )
-        self.summary.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.summary.pack(fill="both", expand=True, padx=10, pady=10)
         self.summary.config(state="disabled")
 
     def render(self):
@@ -533,7 +550,7 @@ class ControlModulePanel(ModulePanel):
             f"model loaded : {'ON' if self.snapshot.get('model_loaded') else 'OFF'}",
             f"serial link  : {'ON' if self.snapshot.get('serial_ok') else 'OFF'}",
             f"video rx     : {'ON' if self.snapshot.get('rx_ok') else 'OFF'}",
-            f"rs rx        : {'ON' if self.snapshot.get('rs_ok') else 'OFF'}",
+            f"bch rx       : {'ON' if self.snapshot.get('bch_ok') else 'OFF'}",
             f"ui refresh   : {'PAUSED' if self.dashboard.ui_paused else 'RUNNING'}",
         ]
         self.summary.config(state="normal")
@@ -544,25 +561,56 @@ class ControlModulePanel(ModulePanel):
 
 class StatsStrip:
     def __init__(self, parent):
-        self.frame = ttk.Frame(parent, style="Root.TFrame")
+        self.frame = tk.Frame(parent, bg=SURFACE_BG)
         self.frame.pack(fill="x", pady=(0, 10))
-        self.frame.columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
         self.cards = {}
+        self.card_widgets = []
+        self.current_columns = None
         specs = [
-            ("serial", "Latest Serial"),
-            ("rssi", "RSSI"),
-            ("noise", "Noise"),
-            ("epoch", "Active Epoch"),
-            ("latency", "Latency (ms)"),
-            ("kdr", "Correction Bits"),
+            ("serial", "Latest Serial", "Stream sequence", ACCENT_BLUE),
+            ("rssi", "RSSI", "Radio strength", ACCENT_TEAL),
+            ("noise", "Noise", "Channel floor", ACCENT_AMBER),
+            ("epoch", "Active Epoch", "Confirmed key window", ACCENT_VIOLET),
+            ("latency", "Latency (ms)", "End-to-end response", ACCENT_PINK),
+            ("kdr", "Correction Bits", "BCH correction ratio", ACCENT_GREEN),
         ]
-        for idx, (key, title) in enumerate(specs):
-            card = ttk.Frame(self.frame, style="Card.TFrame", padding=10)
-            card.grid(row=0, column=idx, sticky="nsew", padx=4)
-            ttk.Label(card, text=title, style="Title.TLabel").pack(anchor="w")
-            value = ttk.Label(card, text="--", style="Value.TLabel")
-            value.pack(anchor="w", pady=(8, 0))
+        for idx, (key, title, subtitle, accent) in enumerate(specs):
+            card = tk.Frame(self.frame, bg=CARD_BG, highlightthickness=1, highlightbackground=CARD_BORDER, bd=0)
+            tk.Frame(card, bg=accent, height=2).pack(fill="x")
+            inner = tk.Frame(card, bg=CARD_BG, padx=12, pady=8)
+            inner.pack(fill="both", expand=True)
+            tk.Label(inner, text=title.upper(), bg=CARD_BG, fg=TEXT_SOFT, font=("Arial", 8, "bold")).pack(anchor="w")
+            value = tk.Label(inner, text="--", bg=CARD_BG, fg=TEXT_MAIN, font=("Consolas", 13, "bold"))
+            value.pack(anchor="w", pady=(5, 1))
+            tk.Label(inner, text=subtitle, bg=CARD_BG, fg=TEXT_MUTED, font=("Arial", 7)).pack(anchor="w")
             self.cards[key] = value
+            self.card_widgets.append(card)
+        self._layout_cards(6)
+        self.frame.bind("<Configure>", self._on_configure)
+
+    def _on_configure(self, event):
+        if event.width >= 1200:
+            columns = 6
+        elif event.width >= 900:
+            columns = 3
+        else:
+            columns = 2
+        self._layout_cards(columns)
+
+    def _layout_cards(self, columns):
+        if self.current_columns == columns:
+            return
+        self.current_columns = columns
+        for idx in range(6):
+            self.frame.columnconfigure(idx, weight=0, uniform="")
+            self.frame.rowconfigure(idx, weight=0)
+        for idx in range(columns):
+            self.frame.columnconfigure(idx, weight=1, uniform="stats")
+        for idx, card in enumerate(self.card_widgets):
+            row = idx // columns
+            col = idx % columns
+            top_pad = 0 if row == 0 else 8
+            card.grid(row=row, column=col, sticky="nsew", padx=5, pady=(top_pad, 0))
 
     def update(self, serial, rssi, noise, epoch, latency, latency_ema, raw_kdr, corr_kdr):
         self.cards["serial"].config(text="--" if serial is None else str(serial))
@@ -589,7 +637,7 @@ class GSNDashboard(tk.Tk):
         self.title("GSN Dashboard - PLKG Ground Station")
         self.geometry("1366x768")
         self.minsize(800, 500)
-        self.configure(bg="#0f172a")
+        self.configure(bg=APP_BG)
 
         self.state_obj = GSNState()
         self.log_queue = queue.Queue()
@@ -615,50 +663,108 @@ class GSNDashboard(tk.Tk):
             style.theme_use("clam")
         except Exception:
             pass
-        style.configure("Root.TFrame", background="#0f172a")
-        style.configure("Card.TFrame", background="#111827", relief="flat")
-        style.configure("Title.TLabel", background="#111827", foreground="#e5e7eb", font=("Arial", 12, "bold"))
-        style.configure("Value.TLabel", background="#111827", foreground="#f8fafc", font=("Consolas", 11, "bold"))
-        style.configure("Muted.TLabel", background="#111827", foreground="#94a3b8", font=("Arial", 10))
-        style.configure("Header.TLabel", background="#0f172a", foreground="#f8fafc", font=("Arial", 15, "bold"))
-        style.configure("TButton", font=("Arial", 11, "bold"), padding=8)
-        style.configure("StatusIdle.TLabel", background="#111827", foreground="#94a3b8", font=("Arial", 10, "bold"))
-        style.configure("StatusWarn.TLabel", background="#111827", foreground="#fbbf24", font=("Arial", 10, "bold"))
-        style.configure("StatusGood.TLabel", background="#111827", foreground="#34d399", font=("Arial", 10, "bold"))
-        style.configure("StatusBad.TLabel", background="#111827", foreground="#f87171", font=("Arial", 10, "bold"))
+        self.configure(bg=APP_BG)
+        style.configure("Root.TFrame", background=APP_BG)
+        style.configure("Card.TFrame", background=CARD_BG, relief="flat")
+        style.configure("Shell.TFrame", background=SURFACE_BG, relief="flat")
+        style.configure("Title.TLabel", background=CARD_BG, foreground=TEXT_MAIN, font=("Arial", 12, "bold"))
+        style.configure("MetricTitle.TLabel", background=CARD_BG, foreground=TEXT_SOFT, font=("Arial", 9, "bold"))
+        style.configure("Muted.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Arial", 10))
+        style.configure("Header.TLabel", background=CARD_BG, foreground=TEXT_MAIN, font=("Arial", 16, "bold"))
+        style.configure("SubHeader.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Arial", 9))
+        style.configure("StatusBanner.TLabel", background=CARD_BG, foreground=ACCENT_BLUE, font=("Consolas", 10, "bold"))
+        style.configure("SectionTitle.TLabel", background=CARD_BG, foreground=TEXT_MAIN, font=("Arial", 11, "bold"))
+        style.configure("SectionMeta.TLabel", background=CARD_BG, foreground=TEXT_SOFT, font=("Arial", 8))
+        style.configure("Badge.TLabel", background=CARD_BG_ALT, foreground=TEXT_MUTED, font=("Arial", 8, "bold"))
+        style.configure("TButton", font=("Arial", 10, "bold"), padding=(9, 6))
+        style.configure("TMenubutton", font=("Arial", 10, "bold"), padding=(7, 5))
+        style.configure("StatusIdle.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Arial", 10, "bold"))
+        style.configure("StatusWarn.TLabel", background=CARD_BG, foreground=ACCENT_AMBER, font=("Arial", 10, "bold"))
+        style.configure("StatusGood.TLabel", background=CARD_BG, foreground=ACCENT_GREEN, font=("Arial", 10, "bold"))
+        style.configure("StatusBad.TLabel", background=CARD_BG, foreground="#fb7185", font=("Arial", 10, "bold"))
+        style.configure(
+            "Panel.TCombobox",
+            fieldbackground=CARD_BG_ALT,
+            background=CARD_BG_ALT,
+            foreground=TEXT_MAIN,
+            arrowcolor=ACCENT_BLUE,
+            bordercolor=CARD_BORDER,
+            lightcolor=CARD_BORDER,
+            darkcolor=CARD_BORDER,
+            insertcolor=TEXT_MAIN,
+            padding=4,
+        )
+        style.map(
+            "Panel.TCombobox",
+            fieldbackground=[("readonly", CARD_BG_ALT)],
+            foreground=[("readonly", TEXT_MAIN)],
+            selectbackground=[("readonly", CARD_BG_ALT)],
+            selectforeground=[("readonly", TEXT_MAIN)],
+        )
 
     def _build_layout(self):
         root = ttk.Frame(self, style="Root.TFrame", padding=12)
         root.pack(fill="both", expand=True)
         self.root_frame = root
 
-        top = ttk.Frame(root, style="Root.TFrame")
-        top.pack(fill="x", pady=(0, 10))
-        ttk.Label(top, text="GSN PLKG Dashboard", style="Header.TLabel").pack(side="left")
-        self.status_banner = ttk.Label(top, text="Backend not started", style="Muted.TLabel")
-        self.status_banner.pack(side="right")
+        topbar = tk.Frame(root, bg=CARD_BG, highlightthickness=1, highlightbackground=CARD_BORDER, bd=0)
+        topbar.pack(fill="x", pady=(0, 10))
+        tk.Frame(topbar, bg=ACCENT_BLUE, height=3).pack(fill="x")
+        top_inner = tk.Frame(topbar, bg=CARD_BG, padx=14, pady=8)
+        top_inner.pack(fill="x")
 
-        control = ttk.Frame(root, style="Card.TFrame", padding=10)
-        control.pack(fill="x", pady=(0, 10))
-        self.start_btn = ttk.Button(control, text="Start GSN Backend", command=self.start_backend)
-        self.start_btn.pack(side="left", padx=(0, 8))
-        self.pause_btn = ttk.Button(control, text="Pause UI Refresh", command=self.toggle_pause)
-        self.pause_btn.pack(side="left", padx=(0, 8))
-        self.clear_btn = ttk.Button(control, text="Clear Log", command=self.clear_log)
-        self.clear_btn.pack(side="left")
-        self.reset_layout_btn = ttk.Button(control, text="Reset Layout", command=self.reset_layout)
-        self.reset_layout_btn.pack(side="left", padx=(8, 8))
-        self.panel_menu_button = ttk.Menubutton(control, text="Panels")
-        self.panel_menu_button.pack(side="left")
-        self.layout_menu_button = ttk.Menubutton(control, text="Layouts")
-        self.layout_menu_button.pack(side="left", padx=(8, 0))
-        ttk.Label(control, text="Drag a panel title bar to move it. Drag pane dividers to resize.", style="Muted.TLabel").pack(side="left", padx=(12, 0))
-        ttk.Label(control, text="Stop does not terminate backend threads in this version.", style="Muted.TLabel").pack(side="right")
+        title_block = tk.Frame(top_inner, bg=CARD_BG)
+        title_block.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_block, text="GSN PLKG Dashboard", style="Header.TLabel").pack(anchor="w")
+        tk.Label(
+            title_block,
+            text="Ground Station / PLKG Live Ops",
+            bg=CARD_BG,
+            fg=TEXT_MUTED,
+            font=("Arial", 9),
+        ).pack(anchor="w", pady=(2, 0))
+
+        status_shell = tk.Frame(
+            top_inner,
+            bg=CARD_BG_ALT,
+            highlightthickness=1,
+            highlightbackground=CARD_BORDER_SOFT,
+            bd=0,
+            padx=11,
+            pady=6,
+        )
+        status_shell.pack(side="left", padx=(12, 10))
+        tk.Label(status_shell, text="BACKEND", bg=CARD_BG_ALT, fg=TEXT_SOFT, font=("Arial", 8, "bold")).pack(anchor="e")
+        self.status_banner = tk.Label(status_shell, text="OFF", bg=CARD_BG_ALT, fg=TEXT_MUTED, font=("Consolas", 9, "bold"))
+        self.status_banner.pack(anchor="e", pady=(3, 0))
+
+        controls = tk.Frame(top_inner, bg=CARD_BG)
+        controls.pack(side="right")
+        self.start_btn = ttk.Button(controls, text="Start", command=self.start_backend)
+        self.start_btn.pack(side="left", padx=(0, 6))
+        self.pause_btn = ttk.Button(controls, text="Pause", command=self.toggle_pause)
+        self.pause_btn.pack(side="left", padx=(0, 6))
+        self.clear_btn = ttk.Button(controls, text="Clear", command=self.clear_log)
+        self.clear_btn.pack(side="left", padx=(0, 6))
+        self.reset_layout_btn = ttk.Button(controls, text="Reset", command=self.reset_layout)
+        self.reset_layout_btn.pack(side="left", padx=(0, 9))
+        tk.Frame(controls, bg=CARD_BORDER_SOFT, width=1, height=26).pack(side="left", padx=(0, 9), pady=2)
+        self.panel_menu_button = ttk.Menubutton(controls, text="Modules")
+        self.panel_menu_button.pack(side="left", padx=(0, 6))
+        self.layout_menu_button = ttk.Menubutton(controls, text="Presets")
+        self.layout_menu_button.pack(side="left")
 
         self.stats_strip = StatsStrip(root)
 
-        workspace = ttk.PanedWindow(root, orient="vertical")
-        workspace.pack(fill="both", expand=True, pady=(0, 10))
+        workspace_shell = tk.Frame(root, bg=CARD_BG, highlightthickness=1, highlightbackground=CARD_BORDER, bd=0)
+        workspace_shell.pack(fill="both", expand=True, pady=(0, 10))
+        tk.Frame(workspace_shell, bg=ACCENT_VIOLET, height=3).pack(fill="x")
+        workspace_head = tk.Frame(workspace_shell, bg=CARD_BG, padx=14, pady=8)
+        workspace_head.pack(fill="x")
+        ttk.Label(workspace_head, text="Live Workspace", style="SectionTitle.TLabel").pack(side="left")
+        ttk.Label(workspace_head, text="Video first / telemetry right / analysis below", style="SectionMeta.TLabel").pack(side="right")
+        workspace = ttk.PanedWindow(workspace_shell, orient="vertical")
+        workspace.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.workspace_panes = {"workspace": workspace}
         main_row = ttk.PanedWindow(workspace, orient="horizontal")
         left_stack = ttk.PanedWindow(main_row, orient="vertical")
@@ -669,24 +775,24 @@ class GSNDashboard(tk.Tk):
         self.workspace_panes["left_stack"] = left_stack
         self.workspace_panes["right_stack"] = right_stack
         self.workspace_panes["bottom_row"] = bottom_row
-        workspace.add(main_row, weight=5)
+        workspace.add(main_row, weight=7)
         workspace.add(bottom_row, weight=2)
-        workspace.add(footer, weight=1)
+        workspace.add(footer, weight=0)
 
-        self.panel_hosts["primary"] = PanelHost(left_stack, "primary", "Drop panels here")
-        self.panel_hosts["auxiliary"] = PanelHost(left_stack, "auxiliary", "Drop panels here")
-        self.panel_hosts["secondary"] = PanelHost(right_stack, "secondary", "Drop panels here")
-        self.panel_hosts["tertiary"] = PanelHost(right_stack, "tertiary", "Drop panels here")
-        self.panel_hosts["analytics_left"] = PanelHost(bottom_row, "analytics_left", "Drop panels here")
-        self.panel_hosts["analytics_right"] = PanelHost(bottom_row, "analytics_right", "Drop panels here")
-        self.panel_hosts["footer"] = PanelHost(footer, "footer", "Drop panels here")
+        self.panel_hosts["primary"] = PanelHost(left_stack, "primary", "Empty slot")
+        self.panel_hosts["auxiliary"] = PanelHost(left_stack, "auxiliary", "Empty slot")
+        self.panel_hosts["secondary"] = PanelHost(right_stack, "secondary", "Empty slot")
+        self.panel_hosts["tertiary"] = PanelHost(right_stack, "tertiary", "Empty slot")
+        self.panel_hosts["analytics_left"] = PanelHost(bottom_row, "analytics_left", "Empty slot")
+        self.panel_hosts["analytics_right"] = PanelHost(bottom_row, "analytics_right", "Empty slot")
+        self.panel_hosts["footer"] = PanelHost(footer, "footer", "Empty slot")
 
-        left_stack.add(self.panel_hosts["primary"], weight=4)
+        left_stack.add(self.panel_hosts["primary"], weight=6)
         left_stack.add(self.panel_hosts["auxiliary"], weight=1)
         right_stack.add(self.panel_hosts["secondary"], weight=1)
         right_stack.add(self.panel_hosts["tertiary"], weight=1)
-        main_row.add(left_stack, weight=4)
-        main_row.add(right_stack, weight=3)
+        main_row.add(left_stack, weight=6)
+        main_row.add(right_stack, weight=2)
         bottom_row.add(self.panel_hosts["analytics_left"], weight=1)
         bottom_row.add(self.panel_hosts["analytics_right"], weight=1)
         self.panel_hosts["footer"].pack(fill="both", expand=True)
@@ -694,51 +800,51 @@ class GSNDashboard(tk.Tk):
         self.default_hosts = {
             "media_main": self.panel_hosts["primary"],
             "control_panel": self.panel_hosts["auxiliary"],
-            "text_main": self.panel_hosts["secondary"],
-            "text_aux": self.panel_hosts["tertiary"],
-            "chart_main": self.panel_hosts["analytics_left"],
-            "chart_aux": self.panel_hosts["analytics_right"],
-            "text_log": self.panel_hosts["footer"],
+            "text_main": self.panel_hosts["analytics_left"],
+            "text_aux": self.panel_hosts["footer"],
+            "chart_main": self.panel_hosts["secondary"],
+            "chart_aux": self.panel_hosts["tertiary"],
+            "text_log": self.panel_hosts["analytics_right"],
         }
         self._init_panels()
         self._init_panel_menu()
         self._init_layout_menu()
-        self.after(0, lambda: self.apply_layout_preset("balanced"))
+        self.after(0, self.apply_auto_layout_preset)
 
     def _init_panels(self):
         self.panels = {
-            "media_main": VideoModulePanel(self, "media_main", "Media Panel", "video"),
-            "control_panel": ControlModulePanel(self, "control_panel", "Control Panel", "session"),
-            "text_main": TextModulePanel(self, "text_main", "Text Panel A", "key_status"),
-            "text_aux": TextModulePanel(self, "text_aux", "Text Panel B", "epoch_history"),
-            "chart_main": ChartModulePanel(self, "chart_main", "Chart Panel A", "latency"),
-            "chart_aux": ChartModulePanel(self, "chart_aux", "Chart Panel B", "signal"),
-            "text_log": TextModulePanel(self, "text_log", "Text Panel Log", "log"),
+            "media_main": VideoModulePanel(self, "media_main", "Decrypted Video", "video"),
+            "control_panel": ControlModulePanel(self, "control_panel", "System State", "session"),
+            "text_main": TextModulePanel(self, "text_main", "Telemetry Snapshot", "log"),
+            "text_aux": TextModulePanel(self, "text_aux", "Epoch History", "epoch_history"),
+            "chart_main": ChartModulePanel(self, "chart_main", "Latency Trend", "latency"),
+            "chart_aux": ChartModulePanel(self, "chart_aux", "RSSI / Noise", "signal"),
+            "text_log": TextModulePanel(self, "text_log", "System Log", "epoch_history"),
         }
-        default_visible = {
+        self.default_visible_panels = {
             "media_main": True,
-            "control_panel": True,
+            "control_panel": False,
             "text_main": True,
-            "text_aux": True,
+            "text_aux": False,
             "chart_main": True,
             "chart_aux": True,
             "text_log": True,
         }
         for key, panel in self.panels.items():
-            panel.visible = default_visible.get(key, True)
+            panel.visible = self.default_visible_panels.get(key, True)
             if panel.visible:
                 panel.show()
 
     def _init_panel_menu(self):
         menu = tk.Menu(self.panel_menu_button, tearoff=False)
         labels = {
-            "media_main": "Media Panel",
-            "control_panel": "Control Panel",
-            "text_main": "Text Panel A",
-            "text_aux": "Text Panel B",
-            "chart_main": "Chart Panel A",
-            "chart_aux": "Chart Panel B",
-            "text_log": "Text Panel Log",
+            "media_main": "Decrypted Video",
+            "control_panel": "System State",
+            "text_main": "Telemetry Snapshot",
+            "text_aux": "Epoch History",
+            "chart_main": "Latency Trend",
+            "chart_aux": "RSSI / Noise",
+            "text_log": "System Log",
         }
         for key, label in labels.items():
             var = tk.BooleanVar(value=self.panels[key].visible)
@@ -748,6 +854,7 @@ class GSNDashboard(tk.Tk):
 
     def _init_layout_menu(self):
         menu = tk.Menu(self.layout_menu_button, tearoff=False)
+        menu.add_command(label="Auto Detect", command=self.apply_auto_layout_preset)
         menu.add_command(label="Balanced", command=lambda: self.apply_layout_preset("balanced"))
         menu.add_command(label="Wide Video", command=lambda: self.apply_layout_preset("wide_video"))
         menu.add_command(label="Focus Video", command=lambda: self.apply_layout_preset("focus_video"))
@@ -805,7 +912,7 @@ class GSNDashboard(tk.Tk):
 
     def reset_layout(self):
         for key, panel in self.panels.items():
-            should_show = True
+            should_show = self.default_visible_panels.get(key, True)
             if isinstance(panel, ModulePanel):
                 panel.content_key = panel.default_content
                 if getattr(panel, "content_var", None) is not None:
@@ -816,11 +923,19 @@ class GSNDashboard(tk.Tk):
                 panel.mount(self.default_hosts[key])
             else:
                 panel.hide()
-        self.apply_layout_preset("balanced")
+        self.apply_auto_layout_preset()
 
     def apply_layout_preset(self, preset):
         self.update_idletasks()
         self._position_panes(preset)
+
+    def _auto_layout_preset_name(self):
+        screen_w = max(self.winfo_screenwidth(), 1)
+        screen_h = max(self.winfo_screenheight(), 1)
+        return "focus_video" if screen_h > screen_w else "balanced"
+
+    def apply_auto_layout_preset(self):
+        self.apply_layout_preset(self._auto_layout_preset_name())
 
     def _safe_sashpos(self, pane, index, value):
         try:
@@ -834,44 +949,59 @@ class GSNDashboard(tk.Tk):
         left_stack = self.workspace_panes["left_stack"]
         right_stack = self.workspace_panes["right_stack"]
         bottom_row = self.workspace_panes["bottom_row"]
+        visible_by_host = {
+            name: any(panel.visible and panel.host is host for panel in self.panels.values())
+            for name, host in self.panel_hosts.items()
+        }
+        control_visible = visible_by_host.get("auxiliary", False)
+        right_lower_visible = visible_by_host.get("tertiary", False)
+        bottom_visible = visible_by_host.get("analytics_left", False) or visible_by_host.get("analytics_right", False)
+        footer_visible = visible_by_host.get("footer", False)
 
         workspace_w = max(workspace.winfo_width(), 1)
         workspace_h = max(workspace.winfo_height(), 1)
         main_h = workspace_h
         side_w = workspace_w
+        collapsed_bottom_h = 18
 
         if preset == "wide_video":
-            self._safe_sashpos(workspace, 0, workspace_h * 0.67)
-            self._safe_sashpos(workspace, 1, workspace_h * 0.86)
-            self._safe_sashpos(main_row, 0, workspace_w * 0.62)
-            self._safe_sashpos(left_stack, 0, main_h * 0.82)
-            self._safe_sashpos(right_stack, 0, main_h * 0.5)
+            main_split = workspace_h * (0.72 if bottom_visible else 0.96)
+            bottom_split = main_split + (workspace_h * 0.25 if bottom_visible else collapsed_bottom_h)
+            self._safe_sashpos(workspace, 0, main_split)
+            self._safe_sashpos(workspace, 1, min(workspace_h * (0.94 if footer_visible else 0.975), bottom_split))
+            self._safe_sashpos(main_row, 0, workspace_w * 0.64)
+            self._safe_sashpos(left_stack, 0, main_h * (0.84 if control_visible else 0.985))
+            self._safe_sashpos(right_stack, 0, main_h * (0.5 if right_lower_visible else 0.97))
             self._safe_sashpos(bottom_row, 0, side_w * 0.5)
             return
 
         if preset == "focus_video":
-            self._safe_sashpos(workspace, 0, workspace_h * 0.74)
-            self._safe_sashpos(workspace, 1, workspace_h * 0.89)
-            self._safe_sashpos(main_row, 0, workspace_w * 0.7)
-            self._safe_sashpos(left_stack, 0, main_h * 0.88)
-            self._safe_sashpos(right_stack, 0, main_h * 0.48)
+            main_split = workspace_h * (0.78 if bottom_visible else 0.97)
+            bottom_split = main_split + (workspace_h * 0.18 if bottom_visible else collapsed_bottom_h)
+            self._safe_sashpos(workspace, 0, main_split)
+            self._safe_sashpos(workspace, 1, min(workspace_h * 0.985, bottom_split))
+            self._safe_sashpos(main_row, 0, workspace_w * 0.70)
+            self._safe_sashpos(left_stack, 0, main_h * (0.92 if control_visible else 0.985))
+            self._safe_sashpos(right_stack, 0, main_h * (0.52 if right_lower_visible else 0.985))
             self._safe_sashpos(bottom_row, 0, side_w * 0.5)
             return
 
         if preset == "analysis":
-            self._safe_sashpos(workspace, 0, workspace_h * 0.55)
-            self._safe_sashpos(workspace, 1, workspace_h * 0.84)
+            self._safe_sashpos(workspace, 0, workspace_h * 0.57)
+            self._safe_sashpos(workspace, 1, workspace_h * (0.96 if bottom_visible else 0.59))
             self._safe_sashpos(main_row, 0, workspace_w * 0.52)
-            self._safe_sashpos(left_stack, 0, main_h * 0.72)
-            self._safe_sashpos(right_stack, 0, main_h * 0.5)
-            self._safe_sashpos(bottom_row, 0, side_w * 0.5)
+            self._safe_sashpos(left_stack, 0, main_h * (0.66 if control_visible else 0.97))
+            self._safe_sashpos(right_stack, 0, main_h * (0.5 if right_lower_visible else 0.97))
+            self._safe_sashpos(bottom_row, 0, side_w * 0.52)
             return
 
-        self._safe_sashpos(workspace, 0, workspace_h * 0.62)
-        self._safe_sashpos(workspace, 1, workspace_h * 0.86)
-        self._safe_sashpos(main_row, 0, workspace_w * 0.58)
-        self._safe_sashpos(left_stack, 0, main_h * 0.8)
-        self._safe_sashpos(right_stack, 0, main_h * 0.5)
+        main_split = workspace_h * (0.72 if bottom_visible else 0.96)
+        bottom_split = main_split + (workspace_h * 0.24 if bottom_visible else collapsed_bottom_h)
+        self._safe_sashpos(workspace, 0, main_split)
+        self._safe_sashpos(workspace, 1, min(workspace_h * (0.94 if footer_visible else 0.975), bottom_split))
+        self._safe_sashpos(main_row, 0, workspace_w * 0.64)
+        self._safe_sashpos(left_stack, 0, main_h * (0.74 if control_visible else 0.985))
+        self._safe_sashpos(right_stack, 0, main_h * (0.50 if right_lower_visible else 0.97))
         self._safe_sashpos(bottom_row, 0, side_w * 0.5)
 
     def log(self, message: str):
@@ -886,8 +1016,11 @@ class GSNDashboard(tk.Tk):
 
     def toggle_pause(self):
         self.ui_paused = not self.ui_paused
-        self.pause_btn.config(text="Resume UI Refresh" if self.ui_paused else "Pause UI Refresh")
-        self.status_banner.config(text="UI paused" if self.ui_paused else "UI running")
+        self.pause_btn.config(text="Resume" if self.ui_paused else "Pause")
+        self.status_banner.config(
+            text="Paused" if self.ui_paused else "Running",
+            fg=ACCENT_AMBER if self.ui_paused else ACCENT_GREEN,
+        )
 
     def start_backend(self):
         with self.state_obj.lock:
@@ -896,7 +1029,7 @@ class GSNDashboard(tk.Tk):
                 return
             self.state_obj.started = True
         self.start_btn.state(["disabled"])
-        self.status_banner.config(text="Starting backend...")
+        self.status_banner.config(text="Starting", fg=ACCENT_AMBER)
         self.log("Starting GSN backend.")
         try:
             send_csi_reset_request()
@@ -909,7 +1042,7 @@ class GSNDashboard(tk.Tk):
             self.state_obj.pending_uav_csi_reset = True
 
         t1 = threading.Thread(target=self._keygen_worker, daemon=True)
-        t2 = threading.Thread(target=self._rs_worker, daemon=True)
+        t2 = threading.Thread(target=self._bch_worker, daemon=True)
         t1.start()
         t2.start()
         self.backend_threads.extend([t1, t2])
@@ -983,16 +1116,16 @@ class GSNDashboard(tk.Tk):
                 self.log(f"Keygen loop error: {e}")
                 time.sleep(0.1)
 
-    def _rs_worker(self):
+    def _bch_worker(self):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             # sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
             sock.bind(("0.0.0.0", 5007))
             with self.state_obj.lock:
-                self.state_obj.rs_started = True
-            self.log("RS parity receiver started on UDP/5007.")
+                self.state_obj.bch_started = True
+            self.log("BCH helper receiver started on UDP/5007.")
         except Exception as e:
-            self.log(f"RS receiver init failed: {e}")
+            self.log(f"BCH receiver init failed: {e}")
             return
 
         last_epoch = -1
@@ -1005,7 +1138,7 @@ class GSNDashboard(tk.Tk):
                     continue
                 epoch = int(parts[1])
                 serial = int(parts[2])
-                parity = parts[3]
+                helper = parts[3]
                 confirm = parts[4]
 
                 with self.state_obj.lock:
@@ -1050,16 +1183,26 @@ class GSNDashboard(tk.Tk):
                 with self.state_obj.lock:
                     local_raw = self.state_obj.gsn_raw_by_serial.get(serial)
                 if local_raw is None:
+                    with self.state_obj.lock:
+                        self.state_obj.video_status = (
+                            f"Waiting for local CSI serial={serial} before BCH correction."
+                        )
+                        self.state_obj.video_status_level = "warn"
                     self.log(f"Waiting for local CSI serial={serial} for epoch={epoch}.")
                     continue
 
                 try:
-                    corrected = rs_decode_key(local_raw, parity)
+                    corrected = bch_decode_key(local_raw, helper)
                 except ValueError as e:
-                    self.log(f"RS correction failed for epoch={epoch}, serial={serial}: {e}")
+                    with self.state_obj.lock:
+                        self.state_obj.video_status = (
+                            f"BCH correction failed for epoch={epoch}. Waiting for next helper."
+                        )
+                        self.state_obj.video_status_level = "warn"
+                    self.log(f"BCH correction failed for epoch={epoch}, serial={serial}: {e}")
                     continue
                 aes = sha256.sha_byte(corrected)
-                if not verify_key_confirm(aes, epoch, serial, parity, confirm):
+                if not verify_key_confirm(aes, epoch, serial, helper, confirm):
                     rejected_epochs.add(epoch)
                     with self.state_obj.lock:
                         self.state_obj.video_status = "Key confirmation failed. Waiting for next epoch."
@@ -1088,7 +1231,7 @@ class GSNDashboard(tk.Tk):
                     self.state_obj.hist_idx += 1
                 self.log(f"[KEY ACTIVE] epoch={epoch} serial={serial} confirmed corrected_bits={raw_kdr:.2f}%")
             except Exception as e:
-                self.log(f"RS loop error: {e}")
+                self.log(f"BCH loop error: {e}")
                 time.sleep(0.05)
 
     @staticmethod
@@ -1171,7 +1314,7 @@ class GSNDashboard(tk.Tk):
                 model_loaded = self.state_obj.model_loaded
                 serial_ok = self.state_obj.serial_connected
                 rx_ok = self.state_obj.receiver_started
-                rs_ok = self.state_obj.rs_started
+                bch_ok = self.state_obj.bch_started
 
             self.stats_strip.update(serial, rssi, noise, epoch, latency, latency_ema, raw_kdr, corr_kdr)
             snapshot = {
@@ -1200,13 +1343,18 @@ class GSNDashboard(tk.Tk):
                 "model_loaded": model_loaded,
                 "serial_ok": serial_ok,
                 "rx_ok": rx_ok,
-                "rs_ok": rs_ok,
+                "bch_ok": bch_ok,
             }
             for panel in self.panels.values():
                 panel.update_snapshot(snapshot)
-            self.status_banner.config(
-                text=f"backend={'ON' if running else 'OFF'} | model={'ON' if model_loaded else 'OFF'} | serial={'ON' if serial_ok else 'OFF'} | videoRX={'ON' if rx_ok else 'OFF'} | rsRX={'ON' if rs_ok else 'OFF'}"
-            )
+            if running:
+                ready_count = sum(1 for item in (model_loaded, serial_ok, rx_ok, bch_ok) if item)
+                self.status_banner.config(
+                    text=f"ON {ready_count}/4",
+                    fg=ACCENT_GREEN if ready_count == 4 else ACCENT_AMBER,
+                )
+            else:
+                self.status_banner.config(text="OFF", fg=TEXT_MUTED)
 
         self.after_ids.append(self.after(33, self._refresh_ui))
 

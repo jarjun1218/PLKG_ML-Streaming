@@ -8,7 +8,7 @@ import cv2
 import sha256
 from csi_control import send_csi_reset_request
 from key_confirm import verify_key_confirm
-from rs_ecc import rs_decode_key
+from bch_reconciliation import bch_decode_key
 from gsn_key_generate import load_model, CSISerialWatcher, generate_key
 from gsn_receiver import GSNReceiver
 from gsn_key_matcher import LiveKDRPlotter
@@ -73,8 +73,8 @@ def keygen_thread():
                     gsn_raw_by_serial.pop(serial, None)
 
 
-# ---------------- RS Receiver Thread ----------------
-def rs_thread(plotter):
+# ---------------- BCH Receiver Thread ----------------
+def bch_thread(plotter):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", 5007))
     last_epoch = -1
@@ -89,7 +89,7 @@ def rs_thread(plotter):
 
         epoch   = int(parts[1])
         serial  = int(parts[2])
-        parity  = parts[3]
+        helper  = parts[3]
         confirm = parts[4]
 
         if pending_uav_csi_reset:
@@ -128,12 +128,12 @@ def rs_thread(plotter):
             continue
 
         try:
-            corrected = rs_decode_key(local_raw, parity)
+            corrected = bch_decode_key(local_raw, helper)
         except ValueError as exc:
-            print(f"[GSN] RS correction failed for epoch={epoch}: {exc}")
+            print(f"[GSN] BCH correction failed for epoch={epoch}: {exc}")
             continue
         aes = sha256.sha_byte(corrected)
-        if not verify_key_confirm(aes, epoch, serial, parity, confirm):
+        if not verify_key_confirm(aes, epoch, serial, helper, confirm):
             rejected_epochs.add(epoch)
             print(f"[GSN] key confirmation failed for epoch={epoch}, serial={serial}")
             continue
@@ -159,14 +159,14 @@ if __name__ == "__main__":
     # 1️⃣ 建立 plotter（但不要啟動）
     plotter = LiveKDRPlotter()
 
-    # Start background key generation and RS reconciliation threads.
+    # Start background key generation and BCH reconciliation threads.
     threading.Thread(
         target=keygen_thread,
         daemon=True
     ).start()
 
     threading.Thread(
-        target=rs_thread,
+        target=bch_thread,
         args=(plotter,),
         daemon=True
     ).start()

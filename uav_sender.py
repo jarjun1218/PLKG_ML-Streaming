@@ -15,7 +15,7 @@ class UAVKeySender:
         new_epoch_burst=3,
     ):
         """
-        get_key_state() -> (epoch, csi_serial, parity_b64, confirm_hex)
+        get_key_state() -> (epoch, csi_serial, helper_b64, confirm_hex)
         """
         self.get_key_state = get_key_state
         self.gsn_ip = gsn_ip
@@ -30,9 +30,9 @@ class UAVKeySender:
         last_send_time = 0.0
 
         while True:
-            epoch, serial, parity, confirm = self.get_key_state()
+            epoch, serial, helper, confirm = self.get_key_state()
             now = time.time()
-            if epoch < 0 or serial is None or confirm is None:
+            if epoch < 0 or serial is None or helper is None or confirm is None:
                 time.sleep(0.05)
                 continue
 
@@ -49,11 +49,11 @@ class UAVKeySender:
                 time.sleep(0.05)
                 continue
 
-            msg = f"R {epoch} {serial} {parity} {confirm}"
+            msg = f"R {epoch} {serial} {helper} {confirm}"
             for _ in range(repeat_count):
                 sock.sendto(msg.encode(), (self.gsn_ip, self.port))
                 time.sleep(0.01)
-            print(f"[UAV] send parity+confirm epoch={epoch}")
+            print(f"[UAV] send helper+confirm epoch={epoch}")
 
             last_epoch = epoch
             last_send_time = time.time()
