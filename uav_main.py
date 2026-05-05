@@ -58,6 +58,7 @@ KEY_UPDATE_INTERVAL_SEC = 5.0
 MODEL_CSI_PATH = "model_reserved/cnn_basic/model_final.pth"
 MODEL_KEY_QUAN_PATH = "model_reserved/cnn_basic_quan/model_final.pth"
 NO_USED_CARRIERS_CH1 = [0,1,2,3,4,5,11,32,59,60,61,62,63]
+NO_USED_CARRIERS_CH13 = [0, 1, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
 
 
 # ======================================================
@@ -147,7 +148,7 @@ class CSISerialWatcher:
             serial = int(parts[1])
             tail = [float(x) for x in parts[5:] if x]
             amps = np.array(tail[:64], dtype=np.float32)
-            amps = np.delete(amps, NO_USED_CARRIERS_CH1)
+            amps = np.delete(amps, NO_USED_CARRIERS_CH13)
             if len(amps) != 51:
                 return None
             peak = np.max(amps)

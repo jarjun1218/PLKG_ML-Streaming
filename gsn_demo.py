@@ -1060,8 +1060,8 @@ class GSNDashboard(tk.Tk):
         try:
             model = load_model("model_reserved/cnn_basic/model_final.pth")
             # watcher = CSISerialWatcher("/dev/ttyUSB0", 115200)
-            # watcher = CSISerialWatcher("/dev/cu.usbserial-0001", 115200)  # macOS
-            watcher = CSISerialWatcher("COM3", 115200)  # Windows
+            watcher = CSISerialWatcher("/dev/cu.usbserial-0001", 115200)  # macOS
+            # watcher = CSISerialWatcher("COM3", 115200)  # Windows
             watcher.start()
             with self.state_obj.lock:
                 self.state_obj.model_loaded = True
