@@ -7,8 +7,12 @@ import time
 
 import cv2
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from picamera2 import Picamera2
 from time_sync import estimate_clock_offset
+
+try:
+    from picamera2 import Picamera2
+except Exception:
+    Picamera2 = None
 
 try:
     from picamera2.encoders import H264Encoder
@@ -505,7 +509,7 @@ class UAVVideoStreamer:
                 time.sleep(0.05)
 
     def _run_hardware(self, sock):
-        if not self.use_hardware_h264 or H264Encoder is None:
+        if not self.use_hardware_h264 or H264Encoder is None or Picamera2 is None:
             return False
 
         cam = None
@@ -601,43 +605,69 @@ class UAVVideoStreamer:
                 pass
 
     def _run_software(self, sock):
-        cam = Picamera2()
-        config = cam.create_video_configuration(
-            main={"size": self.resolution, "format": "RGB888"},
-            buffer_count=2,
-            queue=False,
-        )
-        cam.configure(config)
-        cam.start()
-        self._apply_camera_controls(cam)
+        if Picamera2 is None:
+            print("[UAV] Picamera2 is unavailable; video disabled.")
+            return False
 
-        print(
-            f"[UAV] software JPEG stream started: {self.resolution} @ {self.fps}fps, "
-            f"JPEG={self.jpeg_quality}, chunk={self.chunk}, "
-            f"fixed_exposure={self.fixed_exposure_us}, analogue_gain={self.analogue_gain}"
-        )
-        self.running = True
-
-        producer_thread = threading.Thread(target=self._producer_software, args=(cam,))
-        consumer_thread = threading.Thread(target=self._consumer_software, args=(sock,))
-        producer_thread.start()
-        consumer_thread.start()
+        cam = None
+        producer_thread = None
+        consumer_thread = None
 
         try:
+            cam = Picamera2()
+            config = cam.create_video_configuration(
+                main={"size": self.resolution, "format": "RGB888"},
+                buffer_count=2,
+                queue=False,
+            )
+            cam.configure(config)
+            cam.start()
+            self._apply_camera_controls(cam)
+
+            print(
+                f"[UAV] software JPEG stream started: {self.resolution} @ {self.fps}fps, "
+                f"JPEG={self.jpeg_quality}, chunk={self.chunk}, "
+                f"fixed_exposure={self.fixed_exposure_us}, analogue_gain={self.analogue_gain}"
+            )
+            self.running = True
+
+            producer_thread = threading.Thread(target=self._producer_software, args=(cam,))
+            consumer_thread = threading.Thread(target=self._consumer_software, args=(sock,))
+            producer_thread.start()
+            consumer_thread.start()
+
             while self.running:
                 time.sleep(0.5)
+            return True
+
+        except Exception as e:
+            print(f"[UAV] software JPEG unavailable; video disabled: {e}")
+            return False
         finally:
             self.running = False
-            producer_thread.join(timeout=2)
-            consumer_thread.join(timeout=2)
+            if producer_thread is not None:
+                producer_thread.join(timeout=2)
+            if consumer_thread is not None:
+                consumer_thread.join(timeout=2)
             try:
-                cam.stop()
+                if cam is not None:
+                    cam.stop()
             except Exception:
                 pass
             try:
-                cam.close()
+                if cam is not None:
+                    cam.close()
             except Exception:
                 pass
+
+    def _run_no_camera(self):
+        self.running = True
+        print("[UAV] no camera available; video stream is idle, key processing remains active.")
+        try:
+            while self.running:
+                time.sleep(1.0)
+        finally:
+            self.running = False
 
     def run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -681,7 +711,9 @@ class UAVVideoStreamer:
 
             started_hw = self._run_hardware(sock)
             if not started_hw:
-                self._run_software(sock)
+                started_sw = self._run_software(sock)
+                if not started_sw:
+                    self._run_no_camera()
         except KeyboardInterrupt:
             print("[UAV] Interrupted by user")
             self.running = False

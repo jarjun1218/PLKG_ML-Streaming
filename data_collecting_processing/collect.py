@@ -217,6 +217,10 @@ class CSISerialStreamer:
         except Exception:
             return None
 
+    @staticmethod
+    def _looks_like_eve_csi(line):
+        return "eve," in line.lower()
+
     def _accept_line(self, line):
         now = time.time()
 
@@ -229,6 +233,9 @@ class CSISerialStreamer:
 
         if now < self._discard_until:
             return False
+
+        if self._looks_like_eve_csi(line):
+            return True
 
         serial_num = self._extract_serial_num(line)
         if serial_num is None:

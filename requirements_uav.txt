@@ -5,8 +5,19 @@ cryptography
 pyserial
 reedsolo
 
+# ------ PyTorch 安裝建議 -------
+# 解決 [Errno 28] No space left on device
+# mkdir -p ~/pip-tmp
+# TMPDIR=~/pip-tmp pip install --no-cache-dir torch
+# rm -rf ~/pip-tmp
+
+
 # ---- 樹莓派專用相機套件 ----
 # 注意：若您在 Raspberry Pi OS 使用 picamera2
 # 通常不需要透過 pip 安裝，而是透過系統 apt 安裝：
 # sudo apt install python3-libcamera python3-kms++ python3-picamera2
 # picamera2
+
+# ----- 樹莓派虛擬環境 -------
+# 必須先執行下面這個開啟虛擬環境，才能夠有 picamera2 library
+# python -m venv {ENV} --system-site-packages
