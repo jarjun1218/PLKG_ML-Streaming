@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image, ImageTk
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from scipy.signal import savgol_filter
 
 import sha256
 from csi_control import send_csi_reset_request
@@ -125,6 +126,9 @@ class GSNState:
     latest_rssi: float | None = None
     latest_noise: float | None = None
     latest_csi_time: float | None = None
+    latest_gsn_live_serial: int | None = None
+    latest_gsn_live_csi: np.ndarray | None = None
+    latest_gsn_live_csi_time: float | None = None
     latest_eve_serial: int | None = None
     latest_eve_rssi: float | None = None
     latest_eve_noise: float | None = None
@@ -151,6 +155,11 @@ class GSNState:
     latest_latency_ema_ms: float | None = None
     latest_frame_bgr: np.ndarray | None = None
     latest_frame_time: float | None = None
+    latest_eve_video_bgr: np.ndarray | None = None
+    latest_eve_video_time: float | None = None
+    latest_eve_video_encrypted: bool | None = None
+    video_encryption_enabled: bool = True
+    latest_uav_ip: str | None = None
     video_status: str = "Waiting for frames..."
     video_status_level: str = "idle"
 
@@ -352,7 +361,16 @@ class ModulePanel(BasePanel):
 
 class VideoModulePanel(ModulePanel):
     def __init__(self, dashboard, key="media_main", title="Decrypted Video", default_content="video"):
-        super().__init__(dashboard, key, title, {"video": "Decrypted Video"}, default_content)
+        super().__init__(
+            dashboard,
+            key,
+            title,
+            {
+                "video": "GSN Video",
+                "eve_video": "EVE View",
+            },
+            default_content,
+        )
         self.video_photo = None
         self.viewport_size = (VIDEO_VIEWPORT_MAX_W, VIDEO_VIEWPORT_MAX_H)
 
@@ -407,16 +425,41 @@ class VideoModulePanel(ModulePanel):
         if self.card is None:
             return
 
-        frame = self.snapshot.get("frame")
-        latency = self.snapshot.get("latency_ema")
-        frame_time = self.snapshot.get("frame_time")
-        aes_key = self.snapshot.get("aes_key")
-        video_status = self.snapshot.get("video_status") or "Waiting for UAV video stream."
-        video_status_level = self.snapshot.get("video_status_level") or "idle"
+        is_eve_view = self.content_key == "eve_video"
+        if is_eve_view:
+            frame = self.snapshot.get("eve_video_frame")
+            latency = None
+            frame_time = self.snapshot.get("eve_video_time")
+            encrypted = self.snapshot.get("eve_video_encrypted")
+            encryption_enabled = bool(self.snapshot.get("video_encryption_enabled", True))
+            if encrypted is True:
+                video_status = "EVE cannot decrypt the encrypted stream; showing ciphertext noise."
+                video_status_level = "bad"
+            elif encrypted is False:
+                video_status = "Video encryption is OFF; EVE can decode the plaintext stream."
+                video_status_level = "warn"
+            elif encryption_enabled:
+                video_status = "Waiting for encrypted frames to demonstrate EVE noise."
+                video_status_level = "idle"
+            else:
+                video_status = "Waiting for plaintext frames to demonstrate EVE access."
+                video_status_level = "idle"
+            aes_key = True
+        else:
+            frame = self.snapshot.get("frame")
+            latency = self.snapshot.get("latency_ema")
+            frame_time = self.snapshot.get("frame_time")
+            aes_key = self.snapshot.get("aes_key")
+            video_status = self.snapshot.get("video_status") or "Waiting for UAV video stream."
+            video_status_level = self.snapshot.get("video_status_level") or "idle"
         now = time.time()
 
         if frame is None:
-            if aes_key is not None:
+            if is_eve_view:
+                text = "Waiting for EVE view..."
+                hint = video_status
+                level = video_status_level
+            elif aes_key is not None:
                 text = "Key synced.\nWaiting for fresh UAV video..."
                 hint = "The key is ready. Waiting for the UAV to send a new decodable frame."
                 level = "warn"
@@ -439,7 +482,10 @@ class VideoModulePanel(ModulePanel):
             return
 
         disp = frame.copy()
-        if latency is not None:
+        if is_eve_view:
+            label = "EVE: encrypted noise" if self.snapshot.get("eve_video_encrypted") else "EVE: plaintext video"
+            cv2.putText(disp, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        elif latency is not None:
             cv2.putText(disp, f"Latency={latency:.1f} ms", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         disp = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         h, w = disp.shape[:2]
@@ -479,6 +525,8 @@ class TextModulePanel(ModulePanel):
         rssi = self.snapshot.get("rssi")
         noise = self.snapshot.get("noise")
         gsn_raw = self.snapshot.get("gsn_raw")
+        gsn_live_serial = self.snapshot.get("gsn_live_serial")
+        gsn_live_csi = self.snapshot.get("gsn_live_csi")
         uav_live_serial = self.snapshot.get("uav_live_serial")
         uav_live_csi = self.snapshot.get("uav_live_csi")
         eve_serial = self.snapshot.get("eve_serial")
@@ -488,6 +536,8 @@ class TextModulePanel(ModulePanel):
         eve_csi = self.snapshot.get("eve_csi")
         epoch = self.snapshot.get("epoch")
         aes_key = self.snapshot.get("aes_key")
+        video_encryption_enabled = self.snapshot.get("video_encryption_enabled")
+        latest_uav_ip = self.snapshot.get("latest_uav_ip")
         keys_by_epoch = self.snapshot.get("keys_by_epoch", {})
         latency = self.snapshot.get("latency")
         latency_ema = self.snapshot.get("latency_ema")
@@ -504,8 +554,10 @@ class TextModulePanel(ModulePanel):
             lines = [
                 f"serial       : {serial if serial is not None else '--'}",
                 f"UAV live seq : {uav_live_serial if uav_live_serial is not None else '--'}",
+                f"GSN live seq : {gsn_live_serial if gsn_live_serial is not None else '--'}",
                 f"rssi/noise   : {('--' if rssi is None else f'{rssi:.1f}')}/{('--' if noise is None else f'{noise:.1f}')}",
                 f"raw key      : {short_bits(gsn_raw)}",
+                f"video mode   : {'encrypted' if video_encryption_enabled else 'plaintext'}",
                 f"EVE seq      : {eve_serial if eve_serial is not None else '--'}",
                 f"EVE rssi/noise: {('--' if eve_rssi is None else f'{eve_rssi:.1f}')}/{('--' if eve_noise is None else f'{eve_noise:.1f}')}",
                 f"active epoch : {epoch if epoch is not None else '--'}",
@@ -576,6 +628,8 @@ class TextModulePanel(ModulePanel):
                 f"noise         : {('--' if noise is None else f'{noise:.1f}')}",
                 f"UAV live seq  : {uav_live_serial if uav_live_serial is not None else '--'}",
                 f"UAV live CSI  : {wave_summary(uav_live_csi)}",
+                f"GSN live seq  : {gsn_live_serial if gsn_live_serial is not None else '--'}",
+                f"GSN live CSI  : {wave_summary(gsn_live_csi)}",
                 f"EVE seq       : {eve_serial if eve_serial is not None else '--'}",
                 f"EVE mac       : {eve_mac or '--'}",
                 f"EVE rssi      : {('--' if eve_rssi is None else f'{eve_rssi:.1f}')}",
@@ -589,6 +643,7 @@ class TextModulePanel(ModulePanel):
                 f"corr bits     : {('--' if raw_kdr is None else f'{raw_kdr:.2f}%')}",
                 f"post-check    : {('--' if corr_kdr is None else f'{corr_kdr:.2f}%')}",
                 f"video status  : {video_status or '--'}",
+                f"UAV control IP: {latest_uav_ip or 'broadcast'}",
             ]
         else:
             lines = list(self.dashboard.log_lines)
@@ -609,6 +664,7 @@ class ChartModulePanel(ModulePanel):
         "correction": "Correction Trend",
         "demo_kdr": "Demo KDR",
         "csi": "CSI Waveform",
+        "live_csi": "Live CSI",
         "signal": "RSSI / Noise",
     }
 
@@ -654,14 +710,16 @@ class ChartModulePanel(ModulePanel):
             spine.set_color("#475569")
 
         if self.content_key == "latency":
+            self.ax.set_ylim(0, 100)
+            self.ax.set_xticks([])
             lat_hist = list(self.snapshot.get("lat_hist", []))
             lat_ema_hist = list(self.snapshot.get("lat_ema_hist", []))
-            if lat_hist:
-                x = list(range(len(lat_hist)))
-                self.ax.plot(x, lat_hist, label="Latency raw", alpha=0.35)
+            # if lat_hist:
+            #     x = list(range(len(lat_hist)))
+            #     self.ax.plot(x, lat_hist, label="Latency raw", alpha=0.35)
             if lat_ema_hist:
                 x_ema = list(range(len(lat_ema_hist)))
-                self.ax.plot(x_ema, lat_ema_hist, label="Latency smoothed", linewidth=2.0)
+                self.ax.plot(x_ema, lat_ema_hist, label="Latency", linewidth=2.0)
             self.ax.set_title("Latency", color="#e5e7eb")
             if lat_hist or lat_ema_hist:
                 self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
@@ -698,45 +756,75 @@ class ChartModulePanel(ModulePanel):
             demo = self.snapshot.get("demo") or {}
             uav_demo = self.snapshot.get("uav_demo") or {}
             series = [
-                ("UAV live CSI", self.snapshot.get("uav_live_csi")),
                 ("UAV raw CSI", demo.get("uav_raw_csi") or uav_demo.get("uav_raw_csi")),
-                ("UAV raw CSI 2", demo.get("uav_raw_csi_2") or uav_demo.get("uav_raw_csi_2")),
+                # ("UAV raw CSI 2", demo.get("uav_raw_csi_2") or uav_demo.get("uav_raw_csi_2")),
                 ("UAV CNN CSI", demo.get("uav_cnn_csi") or uav_demo.get("uav_cnn_csi")),
                 ("GSN raw CSI", demo.get("gsn_raw_csi")),
-                ("GSN raw CSI 2", demo.get("gsn_raw_csi_2")),
-                ("EVE raw CSI", self.snapshot.get("eve_csi")),
+                # ("GSN raw CSI 2", demo.get("gsn_raw_csi_2")),
             ]
             plotted = False
             for label, values in series:
                 wave = self._normalized_wave(values)
+                wave = savgol_filter(wave, min(9, len(wave) // 2 * 2 - 1), 3) if wave is not None and len(wave) >= 5 else wave
                 if wave is None:
                     continue
                 self.ax.plot(range(len(wave)), wave, label=label, linewidth=1.7)
                 plotted = True
             self.ax.set_ylim(-0.05, 1.05)
+            self.ax.set_yticks([])
             self.ax.set_title("CSI Waveform", color="#e5e7eb")
             if plotted:
                 self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
 
+        elif self.content_key == "live_csi":
+            series = [
+                ("UAV live CSI", self.snapshot.get("uav_live_csi")),
+                ("GSN live CSI", self.snapshot.get("gsn_live_csi")),
+                ("EVE live CSI", self.snapshot.get("eve_csi")),
+            ]
+            plotted = False
+            for label, values in series:
+                wave = self._normalized_wave(values)
+                wave = savgol_filter(wave, min(9, len(wave) // 2 * 2 - 1), 3) if wave is not None and len(wave) >= 5 else wave
+                if wave is None:
+                    continue
+                self.ax.plot(range(len(wave)), wave, label=label, linewidth=1.8)
+                plotted = True
+            self.ax.set_ylim(-0.05, 1.05)
+            self.ax.set_title("Live CSI Waveform", color="#e5e7eb")
+            self.ax.set_yticks([])
+            if plotted:
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
+
         else:
+            self.ax.set_xlim(0, 50)
+            # self.ax.set_ylim(-100, 0)
+            self.ax.set_xticks([])
             rssi_hist = list(self.snapshot.get("rssi_hist", []))
-            noise_hist = list(self.snapshot.get("noise_hist", []))
             eve_rssi_hist = list(self.snapshot.get("eve_rssi_hist", []))
-            eve_noise_hist = list(self.snapshot.get("eve_noise_hist", []))
+            # ema
+            rssi_ema_hist = []
+            eve_rssi_ema_hist = []
+            for rssi in rssi_hist:
+                if rssi_ema_hist:
+                    new_ema = 0.3 * rssi + 0.7 * rssi_ema_hist[-1]
+                else:
+                    new_ema = rssi
+                rssi_ema_hist.append(new_ema)
+            for eve_rssi in eve_rssi_hist:
+                if eve_rssi_ema_hist:
+                    new_ema = 0.3 * eve_rssi + 0.7 * eve_rssi_ema_hist[-1]
+                else:
+                    new_ema = eve_rssi
+                eve_rssi_ema_hist.append(new_ema)
             if rssi_hist:
                 x = list(range(len(rssi_hist)))
-                self.ax.plot(x, rssi_hist, label="GSN RSSI", linewidth=2.0)
-            if noise_hist:
-                x2 = list(range(len(noise_hist)))
-                self.ax.plot(x2, noise_hist, label="GSN Noise", linewidth=1.6, alpha=0.9)
+                self.ax.plot(x, rssi_ema_hist, label="GSN RSSI", linewidth=2.0)
             if eve_rssi_hist:
                 x3 = list(range(len(eve_rssi_hist)))
-                self.ax.plot(x3, eve_rssi_hist, label="EVE RSSI", linewidth=1.7, alpha=0.9)
-            if eve_noise_hist:
-                x4 = list(range(len(eve_noise_hist)))
-                self.ax.plot(x4, eve_noise_hist, label="EVE Noise", linewidth=1.4, alpha=0.8)
+                self.ax.plot(x3, eve_rssi_ema_hist, label="EVE RSSI", linewidth=1.7, alpha=0.9)
             self.ax.set_title("RSSI / Noise", color="#e5e7eb")
-            if rssi_hist or noise_hist or eve_rssi_hist or eve_noise_hist:
+            if rssi_hist or eve_rssi_hist:
                 self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
 
         self.canvas.draw_idle()
@@ -751,7 +839,7 @@ class ControlModulePanel(ModulePanel):
     def build_body(self, parent):
         self.summary = tk.Text(
             parent,
-            height=6,
+            height=7,
             wrap="word",
             bg="#020617",
             fg="#e2e8f0",
@@ -770,6 +858,7 @@ class ControlModulePanel(ModulePanel):
             f"keygen ready : {'ON' if self.snapshot.get('model_loaded') else 'OFF'}",
             f"serial link  : {'ON' if self.snapshot.get('serial_ok') else 'OFF'}",
             f"EVE serial   : {'ON' if self.snapshot.get('eve_serial_ok') else 'OFF'}",
+            f"video cipher : {'ON' if self.snapshot.get('video_encryption_enabled') else 'OFF'}",
             f"video rx     : {'ON' if self.snapshot.get('rx_ok') else 'OFF'}",
             f"bch rx       : {'ON' if self.snapshot.get('bch_ok') else 'OFF'}",
             f"demo rx      : {'ON' if self.snapshot.get('demo_ok') else ('OFF' if self.snapshot.get('demo_enabled') else 'DISABLED')}",
@@ -965,6 +1054,8 @@ class GSNDashboard(tk.Tk):
         controls.pack(side="right")
         self.start_btn = ttk.Button(controls, text="Start", command=self.start_backend)
         self.start_btn.pack(side="left", padx=(0, 6))
+        self.encrypt_btn = ttk.Button(controls, text="Encrypt ON", command=self.toggle_video_encryption)
+        self.encrypt_btn.pack(side="left", padx=(0, 6))
         self.pause_btn = ttk.Button(controls, text="Pause", command=self.toggle_pause)
         self.pause_btn.pack(side="left", padx=(0, 6))
         self.clear_btn = ttk.Button(controls, text="Clear", command=self.clear_log)
@@ -1023,6 +1114,7 @@ class GSNDashboard(tk.Tk):
         self.default_hosts = {
             "media_main": self.panel_hosts["primary"],
             "control_panel": self.panel_hosts["auxiliary"],
+            "eve_video": self.panel_hosts["auxiliary"],
             "text_main": self.panel_hosts["analytics_left"],
             "text_aux": self.panel_hosts["footer"],
             "chart_main": self.panel_hosts["secondary"],
@@ -1037,15 +1129,17 @@ class GSNDashboard(tk.Tk):
     def _init_panels(self):
         self.panels = {
             "media_main": VideoModulePanel(self, "media_main", "Decrypted Video", "video"),
+            "eve_video": VideoModulePanel(self, "eve_video", "EVE View", "eve_video"),
             "control_panel": ControlModulePanel(self, "control_panel", "System State", "session"),
             "text_main": TextModulePanel(self, "text_main", "Demo Key Snapshot", "demo_keys"),
             "text_aux": TextModulePanel(self, "text_aux", "Epoch History", "epoch_history"),
             "chart_main": ChartModulePanel(self, "chart_main", "Demo KDR", "demo_kdr"),
-            "chart_aux": ChartModulePanel(self, "chart_aux", "CSI Waveform", "csi"),
+            "chart_aux": ChartModulePanel(self, "chart_aux", "Live CSI", "live_csi"),
             "text_log": TextModulePanel(self, "text_log", "System Log", "epoch_history"),
         }
         self.default_visible_panels = {
             "media_main": True,
+            "eve_video": True,
             "control_panel": False,
             "text_main": True,
             "text_aux": False,
@@ -1062,11 +1156,12 @@ class GSNDashboard(tk.Tk):
         menu = tk.Menu(self.panel_menu_button, tearoff=False)
         labels = {
             "media_main": "Decrypted Video",
+            "eve_video": "EVE View",
             "control_panel": "System State",
             "text_main": "Demo Key Snapshot",
             "text_aux": "Epoch History",
             "chart_main": "Demo KDR",
-            "chart_aux": "CSI Waveform",
+            "chart_aux": "Live CSI",
             "text_log": "System Log",
         }
         for key, label in labels.items():
@@ -1237,6 +1332,42 @@ class GSNDashboard(tk.Tk):
             if isinstance(panel, TextModulePanel) and panel.content_key == "log":
                 panel.render()
 
+    def _send_uav_control(self, message: bytes, target_ip=None):
+        target = target_ip or "255.255.255.255"
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            if target == "255.255.255.255":
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            for _ in range(3):
+                sock.sendto(message, (target, UAV_CONTROL_PORT))
+                time.sleep(0.03)
+        finally:
+            sock.close()
+
+    def toggle_video_encryption(self):
+        with self.state_obj.lock:
+            enabled = not self.state_obj.video_encryption_enabled
+            self.state_obj.video_encryption_enabled = enabled
+            target_ip = self.state_obj.latest_uav_ip
+            self.state_obj.latest_eve_video_bgr = None
+            self.state_obj.latest_eve_video_time = None
+            self.state_obj.latest_eve_video_encrypted = None
+
+        command = f"VIDEO_ENCRYPTION {'1' if enabled else '0'}".encode("ascii")
+        try:
+            self._send_uav_control(command, target_ip=target_ip)
+            mode = "ENCRYPTED" if enabled else "PLAINTEXT"
+            target = target_ip or "broadcast"
+            self.log(f"Requested UAV video mode: {mode} ({target}).")
+        except Exception as e:
+            self.log(f"Failed to send video encryption toggle: {e}")
+        self._sync_encrypt_button()
+
+    def _sync_encrypt_button(self):
+        with self.state_obj.lock:
+            enabled = self.state_obj.video_encryption_enabled
+        self.encrypt_btn.config(text="Encrypt ON" if enabled else "Encrypt OFF")
+
     def toggle_pause(self):
         self.ui_paused = not self.ui_paused
         self.pause_btn.config(text="Resume" if self.ui_paused else "Pause")
@@ -1277,7 +1408,11 @@ class GSNDashboard(tk.Tk):
             self.log(f"Demo telemetry disabled: {DEMO_TELEMETRY_IMPORT_ERROR}")
 
         try:
-            rx = GSNReceiver(get_aes_key=self._get_key, on_frame=self._handle_frame)
+            rx = GSNReceiver(
+                get_aes_key=self._get_key,
+                on_frame=self._handle_frame,
+                on_eve_frame=self._handle_eve_frame,
+            )
             rx.start()
             with self.state_obj.lock:
                 self.state_obj.receiver_started = True
@@ -1375,6 +1510,9 @@ class GSNDashboard(tk.Tk):
                     self.state_obj.latest_rssi = rssi
                     self.state_obj.latest_noise = noise
                     self.state_obj.latest_csi_time = csi_time
+                    self.state_obj.latest_gsn_live_serial = serial
+                    self.state_obj.latest_gsn_live_csi = csi.copy()
+                    self.state_obj.latest_gsn_live_csi_time = csi_time
                     self.state_obj.rssi_hist.append(rssi)
                     self.state_obj.noise_hist.append(noise)
                 if serial % 20 == 0:
@@ -1402,6 +1540,8 @@ class GSNDashboard(tk.Tk):
         while True:
             try:
                 data, addr = sock.recvfrom(1024*1024)
+                with self.state_obj.lock:
+                    self.state_obj.latest_uav_ip = addr[0]
                 parts = data.decode(errors="ignore").split()
                 if len(parts) != 5 or parts[0] != "R":
                     continue
@@ -1579,10 +1719,12 @@ class GSNDashboard(tk.Tk):
         joined_logged_epochs = set()
         while True:
             try:
-                data, _ = sock.recvfrom(65535)
+                data, addr = sock.recvfrom(65535)
                 payload = parse_telemetry_packet(data)
                 if not payload:
                     continue
+                with self.state_obj.lock:
+                    self.state_obj.latest_uav_ip = addr[0]
                 if payload.get("packet_type") == "live_csi":
                     live_csi = np.asarray(payload.get("uav_live_csi"), dtype=np.float32)
                     with self.state_obj.lock:
@@ -1635,6 +1777,9 @@ class GSNDashboard(tk.Tk):
         self.state_obj.latest_uav_live_csi = None
         self.state_obj.latest_uav_live_epoch = None
         self.state_obj.latest_uav_live_csi_time = None
+        self.state_obj.latest_gsn_live_serial = None
+        self.state_obj.latest_gsn_live_csi = None
+        self.state_obj.latest_gsn_live_csi_time = None
         self.state_obj.latest_demo_raw_kdr = None
         self.state_obj.latest_demo_target_kdr = None
         self.state_obj.latest_demo_corr_kdr = None
@@ -1726,6 +1871,14 @@ class GSNDashboard(tk.Tk):
             self.state_obj.latency_hist.append(latency_value)
             self.state_obj.latency_ema_hist.append(ema)
 
+    def _handle_eve_frame(self, frame, encrypted):
+        if frame is None:
+            return
+        with self.state_obj.lock:
+            self.state_obj.latest_eve_video_bgr = frame.copy()
+            self.state_obj.latest_eve_video_time = time.time()
+            self.state_obj.latest_eve_video_encrypted = bool(encrypted)
+
     def _get_key(self, epoch):
         with self.state_obj.lock:
             return self.state_obj.keys_by_epoch.get(epoch)
@@ -1763,6 +1916,8 @@ class GSNDashboard(tk.Tk):
                 eve_noise = self.state_obj.latest_eve_noise
                 eve_mac = self.state_obj.latest_eve_mac
                 eve_csi = None if self.state_obj.latest_eve_csi is None else self.state_obj.latest_eve_csi.copy()
+                gsn_live_serial = self.state_obj.latest_gsn_live_serial
+                gsn_live_csi = None if self.state_obj.latest_gsn_live_csi is None else self.state_obj.latest_gsn_live_csi.copy()
                 uav_live_serial = self.state_obj.latest_uav_live_serial
                 uav_live_csi = None if self.state_obj.latest_uav_live_csi is None else self.state_obj.latest_uav_live_csi.copy()
                 uav_live_epoch = self.state_obj.latest_uav_live_epoch
@@ -1778,10 +1933,15 @@ class GSNDashboard(tk.Tk):
                 demo_target_kdr = self.state_obj.latest_demo_target_kdr
                 demo_corr_kdr = self.state_obj.latest_demo_corr_kdr
                 frame = None if self.state_obj.latest_frame_bgr is None else self.state_obj.latest_frame_bgr.copy()
+                eve_video_frame = None if self.state_obj.latest_eve_video_bgr is None else self.state_obj.latest_eve_video_bgr.copy()
+                eve_video_time = self.state_obj.latest_eve_video_time
+                eve_video_encrypted = self.state_obj.latest_eve_video_encrypted
+                video_encryption_enabled = self.state_obj.video_encryption_enabled
                 gsn_raw = self.state_obj.gsn_raw
                 aes_key = self.state_obj.active_key
                 video_status = self.state_obj.video_status
                 video_status_level = self.state_obj.video_status_level
+                latest_uav_ip = self.state_obj.latest_uav_ip
                 keys_by_epoch = dict(self.state_obj.keys_by_epoch)
                 kdr_raw_hist = list(self.state_obj.kdr_raw_hist)
                 kdr_corr_hist = list(self.state_obj.kdr_corr_hist)
@@ -1813,6 +1973,8 @@ class GSNDashboard(tk.Tk):
                 "eve_noise": eve_noise,
                 "eve_mac": eve_mac,
                 "eve_csi": eve_csi,
+                "gsn_live_serial": gsn_live_serial,
+                "gsn_live_csi": gsn_live_csi,
                 "uav_live_serial": uav_live_serial,
                 "uav_live_csi": uav_live_csi,
                 "uav_live_epoch": uav_live_epoch,
@@ -1828,10 +1990,15 @@ class GSNDashboard(tk.Tk):
                 "demo_target_kdr": demo_target_kdr,
                 "demo_corr_kdr": demo_corr_kdr,
                 "frame": frame,
+                "eve_video_frame": eve_video_frame,
+                "eve_video_time": eve_video_time,
+                "eve_video_encrypted": eve_video_encrypted,
+                "video_encryption_enabled": video_encryption_enabled,
                 "gsn_raw": gsn_raw,
                 "aes_key": aes_key,
                 "video_status": video_status,
                 "video_status_level": video_status_level,
+                "latest_uav_ip": latest_uav_ip,
                 "keys_by_epoch": keys_by_epoch,
                 "kdr_raw_hist": kdr_raw_hist,
                 "kdr_corr_hist": kdr_corr_hist,
@@ -1854,6 +2021,7 @@ class GSNDashboard(tk.Tk):
             }
             for panel in self.panels.values():
                 panel.update_snapshot(snapshot)
+            self._sync_encrypt_button()
             if running:
                 ready_items = [model_loaded, serial_ok, eve_serial_ok, rx_ok, bch_ok]
                 if DEMO_TELEMETRY_ENABLED:
