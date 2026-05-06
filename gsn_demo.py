@@ -22,11 +22,22 @@ import sha256
 from csi_control import send_csi_reset_request
 from key_confirm import verify_key_confirm
 from bch_reconciliation import bch_decode_key
-from gsn_key_generate import load_model, CSISerialWatcher, generate_key
+from gsn_key_generate import CSISerialWatcher, generate_key
 from gsn_receiver import GSNReceiver
+try:
+    from demo_telemetry import DEMO_TELEMETRY_PORT, parse_telemetry_packet
+    DEMO_TELEMETRY_IMPORT_ERROR = None
+except ImportError as exc:
+    DEMO_TELEMETRY_PORT = 5009
+    parse_telemetry_packet = None
+    DEMO_TELEMETRY_IMPORT_ERROR = exc
 
 UAV_CONTROL_PORT = 5008
+GSN_CSI_PORT = "/dev/cu.usbserial-0001"
+EVE_CSI_PORT = "/dev/cu.usbserial-3"
+CSI_BAUD = 115200
 RAW_HISTORY_LIMIT = 512
+DEMO_TELEMETRY_ENABLED = parse_telemetry_packet is not None
 VIDEO_VIEWPORT_MAX_W = 1920
 VIDEO_VIEWPORT_MAX_H = 1440
 VIDEO_VIEWPORT_MIN_W = 480
@@ -51,26 +62,90 @@ ACCENT_GREEN = "#4ade80"
 ACCENT_VIOLET = "#9b8cff"
 
 
+def short_bits(bits, limit=64):
+    if not bits:
+        return "--"
+    bits = str(bits)
+    return bits if len(bits) <= limit else bits[:limit] + "..."
+
+
+def fmt_pct(value):
+    return "--" if value is None else f"{value:.2f}%"
+
+
+def wave_summary(values, limit=6):
+    if values is None:
+        return "--"
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return "--"
+    head = ", ".join(f"{v:.3f}" for v in arr[:limit])
+    suffix = ", ..." if arr.size > limit else ""
+    return f"len={arr.size} [{head}{suffix}]"
+
+
+def parse_serial_pair(value):
+    if isinstance(value, (tuple, list)):
+        return tuple(int(item) for item in value)
+    text = str(value).strip()
+    if not text:
+        raise ValueError("empty serial pair")
+    if "," in text:
+        return tuple(int(item) for item in text.split(",") if item != "")
+    if "-" in text:
+        return tuple(int(item) for item in text.split("-") if item != "")
+    serial = int(text)
+    return (serial,)
+
+
+def serial_pair_token(pair):
+    return ",".join(str(int(item)) for item in parse_serial_pair(pair))
+
+
+def serial_pair_label(pair):
+    parsed = parse_serial_pair(pair)
+    return ",".join(str(item) for item in parsed)
+
+
 @dataclass
 class GSNState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     started: bool = False
-    model_loaded: bool = False
+    model_loaded: bool = False  # Kept as a UI readiness flag; GSN no longer loads CNN models.
     serial_connected: bool = False
+    eve_serial_connected: bool = False
     receiver_started: bool = False
     bch_started: bool = False
+    demo_telemetry_started: bool = False
 
     gsn_raw: str | None = None
     gsn_raw_by_serial: dict = field(default_factory=dict)
+    gsn_csi_by_serial: dict = field(default_factory=dict)
     latest_serial: int | None = None
     latest_rssi: float | None = None
     latest_noise: float | None = None
     latest_csi_time: float | None = None
+    latest_eve_serial: int | None = None
+    latest_eve_rssi: float | None = None
+    latest_eve_noise: float | None = None
+    latest_eve_csi: np.ndarray | None = None
+    latest_eve_mac: str | None = None
+    latest_eve_csi_time: float | None = None
     pending_uav_csi_reset: bool = True
 
     last_epoch: int | None = None
     active_key: bytes | None = None
     keys_by_epoch: dict = field(default_factory=dict)
+    gsn_corrected_by_epoch: dict = field(default_factory=dict)
+    epoch_serial_by_epoch: dict = field(default_factory=dict)
+    uav_demo_by_epoch: dict = field(default_factory=dict)
+    latest_uav_demo: dict | None = None
+    latest_demo: dict | None = None
+    latest_demo_telemetry_time: float | None = None
+    latest_uav_live_serial: int | None = None
+    latest_uav_live_csi: np.ndarray | None = None
+    latest_uav_live_epoch: int | None = None
+    latest_uav_live_csi_time: float | None = None
 
     latest_latency_ms: float | None = None
     latest_latency_ema_ms: float | None = None
@@ -81,12 +156,20 @@ class GSNState:
 
     latest_kdr_raw: float | None = None
     latest_kdr_corr: float | None = None
+    latest_demo_raw_kdr: float | None = None
+    latest_demo_target_kdr: float | None = None
+    latest_demo_corr_kdr: float | None = None
     kdr_raw_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     kdr_corr_hist: deque = field(default_factory=lambda: deque(maxlen=100))
+    demo_raw_kdr_hist: deque = field(default_factory=lambda: deque(maxlen=100))
+    demo_corr_kdr_hist: deque = field(default_factory=lambda: deque(maxlen=100))
+    demo_hist_epochs: set = field(default_factory=set)
     latency_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     latency_ema_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     rssi_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     noise_hist: deque = field(default_factory=lambda: deque(maxlen=100))
+    eve_rssi_hist: deque = field(default_factory=lambda: deque(maxlen=100))
+    eve_noise_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     hist_idx: int = 0
 
 
@@ -374,6 +457,7 @@ class VideoModulePanel(ModulePanel):
 class TextModulePanel(ModulePanel):
     TEXT_OPTIONS = {
         "key_status": "Key Status",
+        "demo_keys": "Demo Keys",
         "epoch_history": "Epoch History",
         "log": "System Log",
         "link_snapshot": "Link Snapshot",
@@ -395,6 +479,13 @@ class TextModulePanel(ModulePanel):
         rssi = self.snapshot.get("rssi")
         noise = self.snapshot.get("noise")
         gsn_raw = self.snapshot.get("gsn_raw")
+        uav_live_serial = self.snapshot.get("uav_live_serial")
+        uav_live_csi = self.snapshot.get("uav_live_csi")
+        eve_serial = self.snapshot.get("eve_serial")
+        eve_rssi = self.snapshot.get("eve_rssi")
+        eve_noise = self.snapshot.get("eve_noise")
+        eve_mac = self.snapshot.get("eve_mac")
+        eve_csi = self.snapshot.get("eve_csi")
         epoch = self.snapshot.get("epoch")
         aes_key = self.snapshot.get("aes_key")
         keys_by_epoch = self.snapshot.get("keys_by_epoch", {})
@@ -402,16 +493,73 @@ class TextModulePanel(ModulePanel):
         latency_ema = self.snapshot.get("latency_ema")
         raw_kdr = self.snapshot.get("raw_kdr")
         corr_kdr = self.snapshot.get("corr_kdr")
+        demo = self.snapshot.get("demo")
+        uav_demo = self.snapshot.get("uav_demo")
+        demo_raw_kdr = self.snapshot.get("demo_raw_kdr")
+        demo_target_kdr = self.snapshot.get("demo_target_kdr")
+        demo_corr_kdr = self.snapshot.get("demo_corr_kdr")
         video_status = self.snapshot.get("video_status")
 
         if self.content_key == "key_status":
             lines = [
                 f"serial       : {serial if serial is not None else '--'}",
+                f"UAV live seq : {uav_live_serial if uav_live_serial is not None else '--'}",
                 f"rssi/noise   : {('--' if rssi is None else f'{rssi:.1f}')}/{('--' if noise is None else f'{noise:.1f}')}",
-                f"raw key      : {(gsn_raw[:64] + '...') if gsn_raw else '--'}",
+                f"raw key      : {short_bits(gsn_raw)}",
+                f"EVE seq      : {eve_serial if eve_serial is not None else '--'}",
+                f"EVE rssi/noise: {('--' if eve_rssi is None else f'{eve_rssi:.1f}')}/{('--' if eve_noise is None else f'{eve_noise:.1f}')}",
                 f"active epoch : {epoch if epoch is not None else '--'}",
                 f"aes key      : {(aes_key.hex()[:48] + '...') if isinstance(aes_key, (bytes, bytearray)) else '--'}",
+                f"raw KDR      : {fmt_pct(demo_raw_kdr)}",
+                f"target KDR   : {fmt_pct(demo_target_kdr)}",
+                f"corrected KDR: {fmt_pct(demo_corr_kdr)}",
             ]
+        elif self.content_key == "demo_keys":
+            if not demo and not uav_demo:
+                lines = ["Waiting for demo telemetry..."]
+            elif not demo:
+                pair_label = serial_pair_label(uav_demo.get("serial_pair", (uav_demo.get("serial", "--"),)))
+                lines = [
+                    "UAV demo telemetry received.",
+                    "Waiting for matching GSN serial and confirmed BCH epoch...",
+                    "",
+                    f"epoch/serials    : {uav_demo.get('epoch', '--')}/{pair_label}",
+                    f"UAV raw key      : {short_bits(uav_demo.get('uav_raw_key'))}",
+                    f"UAV raw key 2    : {short_bits(uav_demo.get('uav_raw_key_2'))}",
+                    f"UAV CNN key      : {short_bits(uav_demo.get('uav_cnn_key'))}",
+                    f"UAV CNN-Q key    : {short_bits(uav_demo.get('uav_cnnq_key'))}",
+                    f"UAV active key   : {short_bits(uav_demo.get('uav_corrected_key'))}",
+                    f"UAV raw CSI      : {wave_summary(uav_demo.get('uav_raw_csi'))}",
+                    f"UAV raw CSI 2    : {wave_summary(uav_demo.get('uav_raw_csi_2'))}",
+                    f"UAV CNN CSI      : {wave_summary(uav_demo.get('uav_cnn_csi'))}",
+                    "",
+                    f"raw KDR          : {fmt_pct(demo_raw_kdr)}",
+                    f"active target KDR: {fmt_pct(demo_target_kdr)}",
+                    f"corrected KDR    : {fmt_pct(demo_corr_kdr)}",
+                ]
+            else:
+                pair_label = serial_pair_label(demo.get("serial_pair", (demo.get("serial", "--"),)))
+                lines = [
+                    f"epoch/serials    : {demo.get('epoch', '--')}/{pair_label}",
+                    f"raw KDR          : {fmt_pct(demo.get('raw_kdr'))}",
+                    f"active target KDR: {fmt_pct(demo.get('active_target_kdr'))}",
+                    f"corrected KDR    : {fmt_pct(demo.get('corrected_kdr'))}",
+                    "",
+                    f"UAV raw key      : {short_bits(demo.get('uav_raw_key'))}",
+                    f"UAV raw key 2    : {short_bits(demo.get('uav_raw_key_2'))}",
+                    f"GSN raw key      : {short_bits(demo.get('gsn_raw_key'))}",
+                    f"GSN raw key 2    : {short_bits(demo.get('gsn_raw_key_2'))}",
+                    f"UAV CNN key      : {short_bits(demo.get('uav_cnn_key'))}",
+                    f"UAV CNN-Q key    : {short_bits(demo.get('uav_cnnq_key'))}",
+                    f"UAV active key   : {short_bits(demo.get('uav_corrected_key'))}",
+                    f"GSN corrected key: {short_bits(demo.get('gsn_corrected_key'))}",
+                    "",
+                    f"UAV raw CSI      : {wave_summary(demo.get('uav_raw_csi'))}",
+                    f"UAV raw CSI 2    : {wave_summary(demo.get('uav_raw_csi_2'))}",
+                    f"UAV CNN CSI      : {wave_summary(demo.get('uav_cnn_csi'))}",
+                    f"GSN raw CSI      : {wave_summary(demo.get('gsn_raw_csi'))}",
+                    f"GSN raw CSI 2    : {wave_summary(demo.get('gsn_raw_csi_2'))}",
+                ]
         elif self.content_key == "epoch_history":
             lines = []
             for item_epoch in sorted(keys_by_epoch.keys(), reverse=True)[:20]:
@@ -426,8 +574,18 @@ class TextModulePanel(ModulePanel):
                 f"active epoch  : {epoch if epoch is not None else '--'}",
                 f"rssi          : {('--' if rssi is None else f'{rssi:.1f}')}",
                 f"noise         : {('--' if noise is None else f'{noise:.1f}')}",
+                f"UAV live seq  : {uav_live_serial if uav_live_serial is not None else '--'}",
+                f"UAV live CSI  : {wave_summary(uav_live_csi)}",
+                f"EVE seq       : {eve_serial if eve_serial is not None else '--'}",
+                f"EVE mac       : {eve_mac or '--'}",
+                f"EVE rssi      : {('--' if eve_rssi is None else f'{eve_rssi:.1f}')}",
+                f"EVE noise     : {('--' if eve_noise is None else f'{eve_noise:.1f}')}",
+                f"EVE CSI       : {wave_summary(eve_csi)}",
                 f"latency raw   : {('--' if latency is None else f'{latency:.1f} ms')}",
                 f"latency avg   : {('--' if latency_ema is None else f'{latency_ema:.1f} ms')}",
+                f"raw KDR       : {fmt_pct(demo_raw_kdr)}",
+                f"target KDR    : {fmt_pct(demo_target_kdr)}",
+                f"corrected KDR : {fmt_pct(demo_corr_kdr)}",
                 f"corr bits     : {('--' if raw_kdr is None else f'{raw_kdr:.2f}%')}",
                 f"post-check    : {('--' if corr_kdr is None else f'{corr_kdr:.2f}%')}",
                 f"video status  : {video_status or '--'}",
@@ -449,6 +607,8 @@ class ChartModulePanel(ModulePanel):
     CHART_OPTIONS = {
         "latency": "Latency",
         "correction": "Correction Trend",
+        "demo_kdr": "Demo KDR",
+        "csi": "CSI Waveform",
         "signal": "RSSI / Noise",
     }
 
@@ -468,6 +628,20 @@ class ChartModulePanel(ModulePanel):
         self.fig = fig
         self.ax = ax
         self.canvas = canvas
+
+    @staticmethod
+    def _normalized_wave(values):
+        if values is None:
+            return None
+        arr = np.asarray(values, dtype=np.float32).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return None
+        lo = float(np.min(arr))
+        hi = float(np.max(arr))
+        if hi - lo < 1e-9:
+            return np.zeros_like(arr)
+        return (arr - lo) / (hi - lo)
 
     def render(self):
         if self.card is None:
@@ -506,17 +680,63 @@ class ChartModulePanel(ModulePanel):
             if raw_hist or corr_hist:
                 self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
 
+        elif self.content_key == "demo_kdr":
+            raw_hist = list(self.snapshot.get("demo_raw_kdr_hist", []))
+            corr_hist = list(self.snapshot.get("demo_corr_kdr_hist", []))
+            if raw_hist:
+                x = list(range(len(raw_hist)))
+                self.ax.plot(x, raw_hist, label="Raw key KDR")
+            if corr_hist:
+                x2 = list(range(len(corr_hist)))
+                self.ax.plot(x2, corr_hist, label="Corrected key KDR")
+            self.ax.set_ylim(0, 100)
+            self.ax.set_title("Demo Key KDR (%)", color="#e5e7eb")
+            if raw_hist or corr_hist:
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
+
+        elif self.content_key == "csi":
+            demo = self.snapshot.get("demo") or {}
+            uav_demo = self.snapshot.get("uav_demo") or {}
+            series = [
+                ("UAV live CSI", self.snapshot.get("uav_live_csi")),
+                ("UAV raw CSI", demo.get("uav_raw_csi") or uav_demo.get("uav_raw_csi")),
+                ("UAV raw CSI 2", demo.get("uav_raw_csi_2") or uav_demo.get("uav_raw_csi_2")),
+                ("UAV CNN CSI", demo.get("uav_cnn_csi") or uav_demo.get("uav_cnn_csi")),
+                ("GSN raw CSI", demo.get("gsn_raw_csi")),
+                ("GSN raw CSI 2", demo.get("gsn_raw_csi_2")),
+                ("EVE raw CSI", self.snapshot.get("eve_csi")),
+            ]
+            plotted = False
+            for label, values in series:
+                wave = self._normalized_wave(values)
+                if wave is None:
+                    continue
+                self.ax.plot(range(len(wave)), wave, label=label, linewidth=1.7)
+                plotted = True
+            self.ax.set_ylim(-0.05, 1.05)
+            self.ax.set_title("CSI Waveform", color="#e5e7eb")
+            if plotted:
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
+
         else:
             rssi_hist = list(self.snapshot.get("rssi_hist", []))
             noise_hist = list(self.snapshot.get("noise_hist", []))
+            eve_rssi_hist = list(self.snapshot.get("eve_rssi_hist", []))
+            eve_noise_hist = list(self.snapshot.get("eve_noise_hist", []))
             if rssi_hist:
                 x = list(range(len(rssi_hist)))
-                self.ax.plot(x, rssi_hist, label="RSSI", linewidth=2.0)
+                self.ax.plot(x, rssi_hist, label="GSN RSSI", linewidth=2.0)
             if noise_hist:
                 x2 = list(range(len(noise_hist)))
-                self.ax.plot(x2, noise_hist, label="Noise", linewidth=1.6, alpha=0.9)
+                self.ax.plot(x2, noise_hist, label="GSN Noise", linewidth=1.6, alpha=0.9)
+            if eve_rssi_hist:
+                x3 = list(range(len(eve_rssi_hist)))
+                self.ax.plot(x3, eve_rssi_hist, label="EVE RSSI", linewidth=1.7, alpha=0.9)
+            if eve_noise_hist:
+                x4 = list(range(len(eve_noise_hist)))
+                self.ax.plot(x4, eve_noise_hist, label="EVE Noise", linewidth=1.4, alpha=0.8)
             self.ax.set_title("RSSI / Noise", color="#e5e7eb")
-            if rssi_hist or noise_hist:
+            if rssi_hist or noise_hist or eve_rssi_hist or eve_noise_hist:
                 self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
 
         self.canvas.draw_idle()
@@ -531,7 +751,7 @@ class ControlModulePanel(ModulePanel):
     def build_body(self, parent):
         self.summary = tk.Text(
             parent,
-            height=5,
+            height=6,
             wrap="word",
             bg="#020617",
             fg="#e2e8f0",
@@ -547,10 +767,13 @@ class ControlModulePanel(ModulePanel):
 
         lines = [
             f"backend      : {'ON' if self.snapshot.get('started') else 'OFF'}",
-            f"model loaded : {'ON' if self.snapshot.get('model_loaded') else 'OFF'}",
+            f"keygen ready : {'ON' if self.snapshot.get('model_loaded') else 'OFF'}",
             f"serial link  : {'ON' if self.snapshot.get('serial_ok') else 'OFF'}",
+            f"EVE serial   : {'ON' if self.snapshot.get('eve_serial_ok') else 'OFF'}",
             f"video rx     : {'ON' if self.snapshot.get('rx_ok') else 'OFF'}",
             f"bch rx       : {'ON' if self.snapshot.get('bch_ok') else 'OFF'}",
+            f"demo rx      : {'ON' if self.snapshot.get('demo_ok') else ('OFF' if self.snapshot.get('demo_enabled') else 'DISABLED')}",
+            f"demo packet  : {'SEEN' if self.snapshot.get('uav_demo') else '--'}",
             f"ui refresh   : {'PAUSED' if self.dashboard.ui_paused else 'RUNNING'}",
         ]
         self.summary.config(state="normal")
@@ -572,7 +795,7 @@ class StatsStrip:
             ("noise", "Noise", "Channel floor", ACCENT_AMBER),
             ("epoch", "Active Epoch", "Confirmed key window", ACCENT_VIOLET),
             ("latency", "Latency (ms)", "End-to-end response", ACCENT_PINK),
-            ("kdr", "Correction Bits", "BCH correction ratio", ACCENT_GREEN),
+            ("kdr", "Key KDR", "Raw / corrected mismatch", ACCENT_GREEN),
         ]
         for idx, (key, title, subtitle, accent) in enumerate(specs):
             card = tk.Frame(self.frame, bg=CARD_BG, highlightthickness=1, highlightbackground=CARD_BORDER, bd=0)
@@ -815,10 +1038,10 @@ class GSNDashboard(tk.Tk):
         self.panels = {
             "media_main": VideoModulePanel(self, "media_main", "Decrypted Video", "video"),
             "control_panel": ControlModulePanel(self, "control_panel", "System State", "session"),
-            "text_main": TextModulePanel(self, "text_main", "Telemetry Snapshot", "log"),
+            "text_main": TextModulePanel(self, "text_main", "Demo Key Snapshot", "demo_keys"),
             "text_aux": TextModulePanel(self, "text_aux", "Epoch History", "epoch_history"),
-            "chart_main": ChartModulePanel(self, "chart_main", "Latency Trend", "latency"),
-            "chart_aux": ChartModulePanel(self, "chart_aux", "RSSI / Noise", "signal"),
+            "chart_main": ChartModulePanel(self, "chart_main", "Demo KDR", "demo_kdr"),
+            "chart_aux": ChartModulePanel(self, "chart_aux", "CSI Waveform", "csi"),
             "text_log": TextModulePanel(self, "text_log", "System Log", "epoch_history"),
         }
         self.default_visible_panels = {
@@ -840,10 +1063,10 @@ class GSNDashboard(tk.Tk):
         labels = {
             "media_main": "Decrypted Video",
             "control_panel": "System State",
-            "text_main": "Telemetry Snapshot",
+            "text_main": "Demo Key Snapshot",
             "text_aux": "Epoch History",
-            "chart_main": "Latency Trend",
-            "chart_aux": "RSSI / Noise",
+            "chart_main": "Demo KDR",
+            "chart_aux": "CSI Waveform",
             "text_log": "System Log",
         }
         for key, label in labels.items():
@@ -1046,6 +1269,12 @@ class GSNDashboard(tk.Tk):
         t1.start()
         t2.start()
         self.backend_threads.extend([t1, t2])
+        if DEMO_TELEMETRY_ENABLED:
+            t3 = threading.Thread(target=self._demo_telemetry_worker, daemon=True)
+            t3.start()
+            self.backend_threads.append(t3)
+        elif DEMO_TELEMETRY_IMPORT_ERROR is not None:
+            self.log(f"Demo telemetry disabled: {DEMO_TELEMETRY_IMPORT_ERROR}")
 
         try:
             rx = GSNReceiver(get_aes_key=self._get_key, on_frame=self._handle_frame)
@@ -1058,22 +1287,58 @@ class GSNDashboard(tk.Tk):
 
     def _keygen_worker(self):
         try:
-            model = load_model("model_reserved/cnn_basic/model_final.pth")
             # watcher = CSISerialWatcher("/dev/ttyUSB0", 115200)
-            watcher = CSISerialWatcher("/dev/cu.usbserial-0001", 115200)  # macOS
+            watcher = CSISerialWatcher(GSN_CSI_PORT, CSI_BAUD)  # macOS
             # watcher = CSISerialWatcher("COM3", 115200)  # Windows
             watcher.start()
             with self.state_obj.lock:
                 self.state_obj.model_loaded = True
                 self.state_obj.serial_connected = True
-            self.log(f"CSI model loaded. Serial watcher started on.")
+            self.log("GSN local quantizer ready. CNN/CNN-Q correction runs on UAV.")
         except Exception as e:
             self.log(f"Keygen init failed: {e}")
             return
 
+        eve_watcher = None
+        try:
+            eve_watcher = CSISerialWatcher(EVE_CSI_PORT, CSI_BAUD, endpoint_type="EVE", device="EVE")
+            eve_watcher.start()
+            with self.state_obj.lock:
+                self.state_obj.eve_serial_connected = True
+            self.log(f"EVE CSI watcher started on {EVE_CSI_PORT}.")
+        except Exception as e:
+            self.log(f"EVE CSI watcher failed on {EVE_CSI_PORT}: {e}")
+
         last_serial = None
+        last_eve_serial = None
         while True:
             try:
+                if eve_watcher is not None:
+                    eve = eve_watcher.snapshot().get("EVE")
+                    if eve:
+                        eve_serial = eve.get("serial")
+                        if eve_serial != last_eve_serial:
+                            last_eve_serial = eve_serial
+                            eve_csi = eve.get("csi")
+                            if eve_csi is not None:
+                                eve_csi = np.asarray(eve_csi, dtype=np.float32)
+                            with self.state_obj.lock:
+                                self.state_obj.latest_eve_serial = eve_serial
+                                self.state_obj.latest_eve_rssi = eve.get("rssi")
+                                self.state_obj.latest_eve_noise = eve.get("noise")
+                                self.state_obj.latest_eve_mac = eve.get("mac")
+                                self.state_obj.latest_eve_csi_time = eve.get("time")
+                                self.state_obj.latest_eve_csi = None if eve_csi is None else eve_csi.copy()
+                                if eve.get("rssi") is not None:
+                                    self.state_obj.eve_rssi_hist.append(eve.get("rssi"))
+                                if eve.get("noise") is not None:
+                                    self.state_obj.eve_noise_hist.append(eve.get("noise"))
+                            if isinstance(eve_serial, int) and eve_serial % 20 == 0:
+                                self.log(
+                                    f"Read EVE CSI seq {eve_serial} "
+                                    f"rssi={eve.get('rssi', '--')} noise={eve.get('noise', '--')}."
+                                )
+
                 snap = watcher.snapshot().get("GSN")
                 if not snap:
                     time.sleep(0.01)
@@ -1095,15 +1360,17 @@ class GSNDashboard(tk.Tk):
                 if csi.ndim != 1 or len(csi) < 10:
                     continue
 
-                raw, _ = generate_key(model, csi)
+                raw, _ = generate_key(csi)
                 with self.state_obj.lock:
                     self.state_obj.gsn_raw = raw
                     self.state_obj.gsn_raw_by_serial[serial] = raw
+                    self.state_obj.gsn_csi_by_serial[serial] = csi.copy()
                     if len(self.state_obj.gsn_raw_by_serial) > RAW_HISTORY_LIMIT:
                         overflow = len(self.state_obj.gsn_raw_by_serial) - RAW_HISTORY_LIMIT
                         oldest = sorted(self.state_obj.gsn_raw_by_serial)[:overflow]
                         for old_serial in oldest:
                             self.state_obj.gsn_raw_by_serial.pop(old_serial, None)
+                            self.state_obj.gsn_csi_by_serial.pop(old_serial, None)
                     self.state_obj.latest_serial = serial
                     self.state_obj.latest_rssi = rssi
                     self.state_obj.latest_noise = noise
@@ -1130,6 +1397,8 @@ class GSNDashboard(tk.Tk):
 
         last_epoch = -1
         rejected_epochs = set()
+        seen_helper_epochs = set()
+        waiting_serial_epochs = set()
         while True:
             try:
                 data, addr = sock.recvfrom(1024*1024)
@@ -1137,9 +1406,18 @@ class GSNDashboard(tk.Tk):
                 if len(parts) != 5 or parts[0] != "R":
                     continue
                 epoch = int(parts[1])
-                serial = int(parts[2])
+                serial_token = parts[2]
+                serial_pair = parse_serial_pair(serial_token)
+                serial = serial_pair[0]
+                peer_serial = serial_pair[1] if len(serial_pair) > 1 else serial
                 helper = parts[3]
                 confirm = parts[4]
+                if epoch not in seen_helper_epochs:
+                    seen_helper_epochs.add(epoch)
+                    self.log(
+                        f"Received BCH helper epoch={epoch} serials={serial_pair_label(serial_pair)} "
+                        f"from {addr[0]}:{addr[1]}."
+                    )
 
                 with self.state_obj.lock:
                     need_reset = self.state_obj.pending_uav_csi_reset
@@ -1152,6 +1430,7 @@ class GSNDashboard(tk.Tk):
                         self.state_obj.keys_by_epoch.clear()
                         self.state_obj.last_epoch = None
                         self.state_obj.active_key = None
+                        self._clear_demo_session_locked()
                         self.state_obj.latest_frame_bgr = None
                         self.state_obj.latest_frame_time = None
                         self.state_obj.video_status = "Requested UAV CSI reset. Waiting for fresh epoch."
@@ -1159,6 +1438,7 @@ class GSNDashboard(tk.Tk):
                     self.log(f"Sent RESET_CSI to UAV at {addr[0]}")
                     last_epoch = -1
                     rejected_epochs.clear()
+                    waiting_serial_epochs.clear()
                     continue
 
                 if last_epoch >= 0 and epoch < last_epoch:
@@ -1166,12 +1446,14 @@ class GSNDashboard(tk.Tk):
                         self.state_obj.keys_by_epoch.clear()
                         self.state_obj.last_epoch = None
                         self.state_obj.active_key = None
+                        self._clear_demo_session_locked()
                         self.state_obj.latest_frame_bgr = None
                         self.state_obj.latest_frame_time = None
                         self.state_obj.video_status = "UAV reboot detected. Waiting for key resync and fresh video."
                         self.state_obj.video_status_level = "warn"
                     self.log(f"UAV key session reset detected: epoch {last_epoch}->{epoch}")
                     rejected_epochs.clear()
+                    waiting_serial_epochs.clear()
                 last_epoch = epoch
 
                 with self.state_obj.lock:
@@ -1182,40 +1464,78 @@ class GSNDashboard(tk.Tk):
 
                 with self.state_obj.lock:
                     local_raw = self.state_obj.gsn_raw_by_serial.get(serial)
-                if local_raw is None:
+                    local_peer_raw = self.state_obj.gsn_raw_by_serial.get(peer_serial)
+                    latest_serial = self.state_obj.latest_serial
+                    known_count = len(self.state_obj.gsn_raw_by_serial)
+                if local_raw is None or local_peer_raw is None:
+                    missing = [
+                        str(item)
+                        for item, value in ((serial, local_raw), (peer_serial, local_peer_raw))
+                        if value is None
+                    ]
                     with self.state_obj.lock:
                         self.state_obj.video_status = (
-                            f"Waiting for local CSI serial={serial} before BCH correction."
+                            f"Waiting for local CSI serials={serial_pair_label(serial_pair)} before BCH correction."
                         )
                         self.state_obj.video_status_level = "warn"
-                    self.log(f"Waiting for local CSI serial={serial} for epoch={epoch}.")
+                    if epoch not in waiting_serial_epochs:
+                        waiting_serial_epochs.add(epoch)
+                        self.log(
+                            f"Waiting for local CSI serials={serial_pair_label(serial_pair)} "
+                            f"for epoch={epoch}; missing={','.join(missing)}. "
+                            f"latest_local_serial={latest_serial if latest_serial is not None else '--'} "
+                            f"cached={known_count}."
+                        )
                     continue
 
                 try:
                     corrected = bch_decode_key(local_raw, helper)
                 except ValueError as e:
+                    kdr_hints = []
+                    with self.state_obj.lock:
+                        uav_demo = self.state_obj.uav_demo_by_epoch.get(epoch)
+                        if uav_demo and parse_serial_pair(uav_demo.get("serial_pair", (uav_demo.get("serial"),))) == serial_pair:
+                            for label, key_name, local_value in (
+                                ("raw", "uav_raw_key", local_raw),
+                                ("raw2", "uav_raw_key_2", local_peer_raw),
+                                ("cnn", "uav_cnn_key", local_raw),
+                                ("cnnq", "uav_cnnq_key", local_raw),
+                                ("active", "uav_corrected_key", local_raw),
+                            ):
+                                key_value = uav_demo.get(key_name)
+                                if key_value:
+                                    kdr_hints.append(
+                                        f"{label}_kdr_hint={self._kdr(local_value, key_value) * 100.0:.2f}%"
+                                    )
                     with self.state_obj.lock:
                         self.state_obj.video_status = (
                             f"BCH correction failed for epoch={epoch}. Waiting for next helper."
                         )
                         self.state_obj.video_status_level = "warn"
-                    self.log(f"BCH correction failed for epoch={epoch}, serial={serial}: {e}")
+                    hint = "" if not kdr_hints else " " + " ".join(kdr_hints)
+                    self.log(f"BCH correction failed for epoch={epoch}, serials={serial_pair_label(serial_pair)}:{hint} {e}")
                     continue
                 aes = sha256.sha_byte(corrected)
-                if not verify_key_confirm(aes, epoch, serial, helper, confirm):
+                if not verify_key_confirm(aes, epoch, serial_token, helper, confirm):
                     rejected_epochs.add(epoch)
                     with self.state_obj.lock:
                         self.state_obj.video_status = "Key confirmation failed. Waiting for next epoch."
                         self.state_obj.video_status_level = "warn"
                         self.state_obj.last_epoch = None
                         self.state_obj.active_key = None
-                    self.log(f"Key confirmation failed for epoch={epoch}, serial={serial}.")
+                    self.log(f"Key confirmation failed for epoch={epoch}, serials={serial_pair_label(serial_pair)}.")
                     continue
 
                 raw_kdr = self._kdr(local_raw, corrected) * 100.0
 
+                demo_snapshot = None
                 with self.state_obj.lock:
                     self.state_obj.keys_by_epoch[epoch] = aes
+                    self.state_obj.gsn_corrected_by_epoch[epoch] = corrected
+                    self.state_obj.epoch_serial_by_epoch[epoch] = serial_pair
+                    self._trim_dict_locked(self.state_obj.gsn_corrected_by_epoch, RAW_HISTORY_LIMIT)
+                    self._trim_dict_locked(self.state_obj.epoch_serial_by_epoch, RAW_HISTORY_LIMIT)
+                    demo_snapshot = self._refresh_demo_snapshot_locked(epoch)
                     self.state_obj.last_epoch = epoch
                     self.state_obj.active_key = aes
                     frame_is_stale = (
@@ -1229,10 +1549,156 @@ class GSNDashboard(tk.Tk):
                     self.state_obj.latest_kdr_corr = None
                     self.state_obj.kdr_raw_hist.append(raw_kdr)
                     self.state_obj.hist_idx += 1
-                self.log(f"[KEY ACTIVE] epoch={epoch} serial={serial} confirmed corrected_bits={raw_kdr:.2f}%")
+                if demo_snapshot:
+                    self.log(
+                        f"[KEY ACTIVE] epoch={epoch} serial={serial} "
+                        f"serials={serial_pair_label(serial_pair)} "
+                        f"raw_kdr={demo_snapshot['raw_kdr']:.2f}% "
+                        f"active_target_kdr={demo_snapshot['active_target_kdr']:.2f}% "
+                        f"corrected_kdr={demo_snapshot['corrected_kdr']:.2f}% "
+                        f"correction_bits={raw_kdr:.2f}%"
+                    )
+                else:
+                    self.log(f"[KEY ACTIVE] epoch={epoch} serials={serial_pair_label(serial_pair)} confirmed corrected_bits={raw_kdr:.2f}%")
             except Exception as e:
                 self.log(f"BCH loop error: {e}")
                 time.sleep(0.05)
+
+    def _demo_telemetry_worker(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("0.0.0.0", DEMO_TELEMETRY_PORT))
+            with self.state_obj.lock:
+                self.state_obj.demo_telemetry_started = True
+            self.log(f"Demo telemetry receiver started on UDP/{DEMO_TELEMETRY_PORT}.")
+        except Exception as e:
+            self.log(f"Demo telemetry receiver init failed: {e}")
+            return
+
+        raw_logged_epochs = set()
+        joined_logged_epochs = set()
+        while True:
+            try:
+                data, _ = sock.recvfrom(65535)
+                payload = parse_telemetry_packet(data)
+                if not payload:
+                    continue
+                if payload.get("packet_type") == "live_csi":
+                    live_csi = np.asarray(payload.get("uav_live_csi"), dtype=np.float32)
+                    with self.state_obj.lock:
+                        self.state_obj.latest_uav_live_serial = payload.get("serial")
+                        self.state_obj.latest_uav_live_csi = live_csi.copy()
+                        self.state_obj.latest_uav_live_epoch = payload.get("epoch")
+                        self.state_obj.latest_uav_live_csi_time = payload.get("time", time.time())
+                    continue
+                epoch = payload["epoch"]
+                serial = payload["serial"]
+                with self.state_obj.lock:
+                    self.state_obj.uav_demo_by_epoch[epoch] = payload
+                    self.state_obj.latest_uav_demo = dict(payload)
+                    self.state_obj.latest_demo_telemetry_time = payload.get("time", time.time())
+                    self._trim_dict_locked(self.state_obj.uav_demo_by_epoch, RAW_HISTORY_LIMIT)
+                    demo_snapshot = self._refresh_demo_snapshot_locked(epoch)
+                if epoch not in raw_logged_epochs:
+                    raw_logged_epochs.add(epoch)
+                    self.log(
+                        f"Received demo telemetry epoch={epoch} "
+                        f"serials={serial_pair_label(payload.get('serial_pair', (serial,)))}."
+                    )
+                if demo_snapshot and epoch not in joined_logged_epochs:
+                    joined_logged_epochs.add(epoch)
+                    self.log(
+                        f"Demo telemetry joined epoch={epoch} "
+                        f"raw_kdr={demo_snapshot['raw_kdr']:.2f}% "
+                        f"corrected_kdr={demo_snapshot['corrected_kdr']:.2f}%"
+                    )
+            except Exception as e:
+                self.log(f"Demo telemetry loop error: {e}")
+                time.sleep(0.05)
+
+    @staticmethod
+    def _trim_dict_locked(values, limit):
+        if len(values) <= limit:
+            return
+        overflow = len(values) - limit
+        for key in sorted(values)[:overflow]:
+            values.pop(key, None)
+
+    def _clear_demo_session_locked(self):
+        self.state_obj.gsn_corrected_by_epoch.clear()
+        self.state_obj.epoch_serial_by_epoch.clear()
+        self.state_obj.uav_demo_by_epoch.clear()
+        self.state_obj.latest_uav_demo = None
+        self.state_obj.latest_demo = None
+        self.state_obj.latest_demo_telemetry_time = None
+        self.state_obj.latest_uav_live_serial = None
+        self.state_obj.latest_uav_live_csi = None
+        self.state_obj.latest_uav_live_epoch = None
+        self.state_obj.latest_uav_live_csi_time = None
+        self.state_obj.latest_demo_raw_kdr = None
+        self.state_obj.latest_demo_target_kdr = None
+        self.state_obj.latest_demo_corr_kdr = None
+        self.state_obj.demo_raw_kdr_hist.clear()
+        self.state_obj.demo_corr_kdr_hist.clear()
+        self.state_obj.demo_hist_epochs.clear()
+
+    def _refresh_demo_snapshot_locked(self, epoch):
+        uav_demo = self.state_obj.uav_demo_by_epoch.get(epoch)
+        gsn_corrected_key = self.state_obj.gsn_corrected_by_epoch.get(epoch)
+        serial_pair = self.state_obj.epoch_serial_by_epoch.get(epoch)
+        if not uav_demo or gsn_corrected_key is None or serial_pair is None:
+            return None
+        serial_pair = parse_serial_pair(serial_pair)
+        if parse_serial_pair(uav_demo.get("serial_pair", (uav_demo.get("serial"),))) != serial_pair:
+            return None
+        serial = serial_pair[0]
+        peer_serial = serial_pair[1] if len(serial_pair) > 1 else serial
+
+        gsn_raw_key = self.state_obj.gsn_raw_by_serial.get(serial)
+        gsn_raw_key_2 = self.state_obj.gsn_raw_by_serial.get(peer_serial)
+        gsn_raw_csi = self.state_obj.gsn_csi_by_serial.get(serial)
+        gsn_raw_csi_2 = self.state_obj.gsn_csi_by_serial.get(peer_serial)
+        if gsn_raw_key is None or gsn_raw_key_2 is None or gsn_raw_csi is None or gsn_raw_csi_2 is None:
+            return None
+
+        raw_kdr = self._kdr(gsn_raw_key, uav_demo["uav_raw_key"]) * 100.0
+        active_target_kdr = self._kdr(gsn_raw_key, uav_demo["uav_corrected_key"]) * 100.0
+        corrected_kdr = self._kdr(gsn_corrected_key, uav_demo["uav_corrected_key"]) * 100.0
+        snapshot = {
+            "epoch": epoch,
+            "serial": serial,
+            "serial_pair": serial_pair,
+            "uav_raw_csi": list(uav_demo["uav_raw_csi"]),
+            "uav_raw_csi_2": uav_demo.get("uav_raw_csi_2"),
+            "uav_cnn_csi": uav_demo.get("uav_cnn_csi"),
+            "gsn_raw_csi": np.asarray(gsn_raw_csi, dtype=np.float32).tolist(),
+            "gsn_raw_csi_2": np.asarray(gsn_raw_csi_2, dtype=np.float32).tolist(),
+            "uav_raw_key": uav_demo["uav_raw_key"],
+            "uav_raw_key_2": uav_demo.get("uav_raw_key_2"),
+            "gsn_raw_key": gsn_raw_key,
+            "gsn_raw_key_2": gsn_raw_key_2,
+            "uav_cnn_key": uav_demo.get("uav_cnn_key"),
+            "uav_cnnq_key": uav_demo.get("uav_cnnq_key"),
+            "uav_corrected_key": uav_demo["uav_corrected_key"],
+            "gsn_corrected_key": gsn_corrected_key,
+            "raw_kdr": raw_kdr,
+            "active_target_kdr": active_target_kdr,
+            "corrected_kdr": corrected_kdr,
+            "time": time.time(),
+        }
+        self.state_obj.latest_demo = snapshot
+        self.state_obj.latest_demo_raw_kdr = raw_kdr
+        self.state_obj.latest_demo_target_kdr = active_target_kdr
+        self.state_obj.latest_demo_corr_kdr = corrected_kdr
+
+        if epoch not in self.state_obj.demo_hist_epochs:
+            self.state_obj.demo_raw_kdr_hist.append(raw_kdr)
+            self.state_obj.demo_corr_kdr_hist.append(corrected_kdr)
+            self.state_obj.demo_hist_epochs.add(epoch)
+            if len(self.state_obj.demo_hist_epochs) > RAW_HISTORY_LIMIT:
+                self.state_obj.demo_hist_epochs.clear()
+
+        return snapshot
 
     @staticmethod
     def _request_uav_csi_reset(uav_ip):
@@ -1292,12 +1758,25 @@ class GSNDashboard(tk.Tk):
                 serial = self.state_obj.latest_serial
                 rssi = self.state_obj.latest_rssi
                 noise = self.state_obj.latest_noise
+                eve_serial = self.state_obj.latest_eve_serial
+                eve_rssi = self.state_obj.latest_eve_rssi
+                eve_noise = self.state_obj.latest_eve_noise
+                eve_mac = self.state_obj.latest_eve_mac
+                eve_csi = None if self.state_obj.latest_eve_csi is None else self.state_obj.latest_eve_csi.copy()
+                uav_live_serial = self.state_obj.latest_uav_live_serial
+                uav_live_csi = None if self.state_obj.latest_uav_live_csi is None else self.state_obj.latest_uav_live_csi.copy()
+                uav_live_epoch = self.state_obj.latest_uav_live_epoch
                 epoch = self.state_obj.last_epoch
                 latency = self.state_obj.latest_latency_ms
                 latency_ema = self.state_obj.latest_latency_ema_ms
                 frame_time = self.state_obj.latest_frame_time
                 raw_kdr = self.state_obj.latest_kdr_raw
                 corr_kdr = self.state_obj.latest_kdr_corr
+                demo = None if self.state_obj.latest_demo is None else dict(self.state_obj.latest_demo)
+                uav_demo = None if self.state_obj.latest_uav_demo is None else dict(self.state_obj.latest_uav_demo)
+                demo_raw_kdr = self.state_obj.latest_demo_raw_kdr
+                demo_target_kdr = self.state_obj.latest_demo_target_kdr
+                demo_corr_kdr = self.state_obj.latest_demo_corr_kdr
                 frame = None if self.state_obj.latest_frame_bgr is None else self.state_obj.latest_frame_bgr.copy()
                 gsn_raw = self.state_obj.gsn_raw
                 aes_key = self.state_obj.active_key
@@ -1306,27 +1785,48 @@ class GSNDashboard(tk.Tk):
                 keys_by_epoch = dict(self.state_obj.keys_by_epoch)
                 kdr_raw_hist = list(self.state_obj.kdr_raw_hist)
                 kdr_corr_hist = list(self.state_obj.kdr_corr_hist)
+                demo_raw_kdr_hist = list(self.state_obj.demo_raw_kdr_hist)
+                demo_corr_kdr_hist = list(self.state_obj.demo_corr_kdr_hist)
                 lat_hist = list(self.state_obj.latency_hist)
                 lat_ema_hist = list(self.state_obj.latency_ema_hist)
                 rssi_hist = list(self.state_obj.rssi_hist)
                 noise_hist = list(self.state_obj.noise_hist)
+                eve_rssi_hist = list(self.state_obj.eve_rssi_hist)
+                eve_noise_hist = list(self.state_obj.eve_noise_hist)
                 running = self.state_obj.started
                 model_loaded = self.state_obj.model_loaded
                 serial_ok = self.state_obj.serial_connected
+                eve_serial_ok = self.state_obj.eve_serial_connected
                 rx_ok = self.state_obj.receiver_started
                 bch_ok = self.state_obj.bch_started
+                demo_ok = self.state_obj.demo_telemetry_started
 
-            self.stats_strip.update(serial, rssi, noise, epoch, latency, latency_ema, raw_kdr, corr_kdr)
+            strip_raw_kdr = demo_raw_kdr if demo_raw_kdr is not None else raw_kdr
+            strip_corr_kdr = demo_corr_kdr if demo_corr_kdr is not None else corr_kdr
+            self.stats_strip.update(serial, rssi, noise, epoch, latency, latency_ema, strip_raw_kdr, strip_corr_kdr)
             snapshot = {
                 "serial": serial,
                 "rssi": rssi,
                 "noise": noise,
+                "eve_serial": eve_serial,
+                "eve_rssi": eve_rssi,
+                "eve_noise": eve_noise,
+                "eve_mac": eve_mac,
+                "eve_csi": eve_csi,
+                "uav_live_serial": uav_live_serial,
+                "uav_live_csi": uav_live_csi,
+                "uav_live_epoch": uav_live_epoch,
                 "epoch": epoch,
                 "latency": latency,
                 "latency_ema": latency_ema,
                 "frame_time": frame_time,
                 "raw_kdr": raw_kdr,
                 "corr_kdr": corr_kdr,
+                "demo": demo,
+                "uav_demo": uav_demo,
+                "demo_raw_kdr": demo_raw_kdr,
+                "demo_target_kdr": demo_target_kdr,
+                "demo_corr_kdr": demo_corr_kdr,
                 "frame": frame,
                 "gsn_raw": gsn_raw,
                 "aes_key": aes_key,
@@ -1335,23 +1835,34 @@ class GSNDashboard(tk.Tk):
                 "keys_by_epoch": keys_by_epoch,
                 "kdr_raw_hist": kdr_raw_hist,
                 "kdr_corr_hist": kdr_corr_hist,
+                "demo_raw_kdr_hist": demo_raw_kdr_hist,
+                "demo_corr_kdr_hist": demo_corr_kdr_hist,
                 "lat_hist": lat_hist,
                 "lat_ema_hist": lat_ema_hist,
                 "rssi_hist": rssi_hist,
                 "noise_hist": noise_hist,
+                "eve_rssi_hist": eve_rssi_hist,
+                "eve_noise_hist": eve_noise_hist,
                 "started": running,
                 "model_loaded": model_loaded,
                 "serial_ok": serial_ok,
+                "eve_serial_ok": eve_serial_ok,
                 "rx_ok": rx_ok,
                 "bch_ok": bch_ok,
+                "demo_ok": demo_ok,
+                "demo_enabled": DEMO_TELEMETRY_ENABLED,
             }
             for panel in self.panels.values():
                 panel.update_snapshot(snapshot)
             if running:
-                ready_count = sum(1 for item in (model_loaded, serial_ok, rx_ok, bch_ok) if item)
+                ready_items = [model_loaded, serial_ok, eve_serial_ok, rx_ok, bch_ok]
+                if DEMO_TELEMETRY_ENABLED:
+                    ready_items.append(demo_ok)
+                ready_count = sum(1 for item in ready_items if item)
+                ready_total = len(ready_items)
                 self.status_banner.config(
-                    text=f"ON {ready_count}/4",
-                    fg=ACCENT_GREEN if ready_count == 4 else ACCENT_AMBER,
+                    text=f"ON {ready_count}/{ready_total}",
+                    fg=ACCENT_GREEN if ready_count == ready_total else ACCENT_AMBER,
                 )
             else:
                 self.status_banner.config(text="OFF", fg=TEXT_MUTED)
