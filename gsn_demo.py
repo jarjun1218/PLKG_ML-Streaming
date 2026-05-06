@@ -25,34 +25,19 @@ from bch_reconciliation import bch_decode_key
 from gsn_key_generate import CSISerialWatcher, generate_key
 from gsn_receiver import GSNReceiver
 try:
-<<<<<<< HEAD
-    from demo_telemetry import DEMO_TELEMETRY_PORT, parse_demo_packet
-    DEMO_TELEMETRY_IMPORT_ERROR = None
-except ImportError as exc:
-    DEMO_TELEMETRY_PORT = 5009
-    parse_demo_packet = None
-=======
     from demo_telemetry import DEMO_TELEMETRY_PORT, parse_telemetry_packet
     DEMO_TELEMETRY_IMPORT_ERROR = None
 except ImportError as exc:
     DEMO_TELEMETRY_PORT = 5009
     parse_telemetry_packet = None
->>>>>>> refs/remotes/origin/main
     DEMO_TELEMETRY_IMPORT_ERROR = exc
 
 UAV_CONTROL_PORT = 5008
 GSN_CSI_PORT = "/dev/cu.usbserial-0001"
-<<<<<<< HEAD
-EVE_CSI_PORT = "/dev/cu.usbserial-4"
-CSI_BAUD = 115200
-RAW_HISTORY_LIMIT = 512
-DEMO_TELEMETRY_ENABLED = parse_demo_packet is not None
-=======
 EVE_CSI_PORT = "/dev/cu.usbserial-3"
 CSI_BAUD = 115200
 RAW_HISTORY_LIMIT = 512
 DEMO_TELEMETRY_ENABLED = parse_telemetry_packet is not None
->>>>>>> refs/remotes/origin/main
 VIDEO_VIEWPORT_MAX_W = 1920
 VIDEO_VIEWPORT_MAX_H = 1440
 VIDEO_VIEWPORT_MIN_W = 480
@@ -157,13 +142,10 @@ class GSNState:
     latest_uav_demo: dict | None = None
     latest_demo: dict | None = None
     latest_demo_telemetry_time: float | None = None
-<<<<<<< HEAD
-=======
     latest_uav_live_serial: int | None = None
     latest_uav_live_csi: np.ndarray | None = None
     latest_uav_live_epoch: int | None = None
     latest_uav_live_csi_time: float | None = None
->>>>>>> refs/remotes/origin/main
 
     latest_latency_ms: float | None = None
     latest_latency_ema_ms: float | None = None
@@ -497,11 +479,8 @@ class TextModulePanel(ModulePanel):
         rssi = self.snapshot.get("rssi")
         noise = self.snapshot.get("noise")
         gsn_raw = self.snapshot.get("gsn_raw")
-<<<<<<< HEAD
-=======
         uav_live_serial = self.snapshot.get("uav_live_serial")
         uav_live_csi = self.snapshot.get("uav_live_csi")
->>>>>>> refs/remotes/origin/main
         eve_serial = self.snapshot.get("eve_serial")
         eve_rssi = self.snapshot.get("eve_rssi")
         eve_noise = self.snapshot.get("eve_noise")
@@ -595,11 +574,8 @@ class TextModulePanel(ModulePanel):
                 f"active epoch  : {epoch if epoch is not None else '--'}",
                 f"rssi          : {('--' if rssi is None else f'{rssi:.1f}')}",
                 f"noise         : {('--' if noise is None else f'{noise:.1f}')}",
-<<<<<<< HEAD
-=======
                 f"UAV live seq  : {uav_live_serial if uav_live_serial is not None else '--'}",
                 f"UAV live CSI  : {wave_summary(uav_live_csi)}",
->>>>>>> refs/remotes/origin/main
                 f"EVE seq       : {eve_serial if eve_serial is not None else '--'}",
                 f"EVE mac       : {eve_mac or '--'}",
                 f"EVE rssi      : {('--' if eve_rssi is None else f'{eve_rssi:.1f}')}",
@@ -722,10 +698,7 @@ class ChartModulePanel(ModulePanel):
             demo = self.snapshot.get("demo") or {}
             uav_demo = self.snapshot.get("uav_demo") or {}
             series = [
-<<<<<<< HEAD
-=======
                 ("UAV live CSI", self.snapshot.get("uav_live_csi")),
->>>>>>> refs/remotes/origin/main
                 ("UAV raw CSI", demo.get("uav_raw_csi") or uav_demo.get("uav_raw_csi")),
                 ("UAV raw CSI 2", demo.get("uav_raw_csi_2") or uav_demo.get("uav_raw_csi_2")),
                 ("UAV CNN CSI", demo.get("uav_cnn_csi") or uav_demo.get("uav_cnn_csi")),
@@ -1607,11 +1580,6 @@ class GSNDashboard(tk.Tk):
         while True:
             try:
                 data, _ = sock.recvfrom(65535)
-<<<<<<< HEAD
-                payload = parse_demo_packet(data)
-                if not payload:
-                    continue
-=======
                 payload = parse_telemetry_packet(data)
                 if not payload:
                     continue
@@ -1623,7 +1591,6 @@ class GSNDashboard(tk.Tk):
                         self.state_obj.latest_uav_live_epoch = payload.get("epoch")
                         self.state_obj.latest_uav_live_csi_time = payload.get("time", time.time())
                     continue
->>>>>>> refs/remotes/origin/main
                 epoch = payload["epoch"]
                 serial = payload["serial"]
                 with self.state_obj.lock:
@@ -1664,13 +1631,10 @@ class GSNDashboard(tk.Tk):
         self.state_obj.latest_uav_demo = None
         self.state_obj.latest_demo = None
         self.state_obj.latest_demo_telemetry_time = None
-<<<<<<< HEAD
-=======
         self.state_obj.latest_uav_live_serial = None
         self.state_obj.latest_uav_live_csi = None
         self.state_obj.latest_uav_live_epoch = None
         self.state_obj.latest_uav_live_csi_time = None
->>>>>>> refs/remotes/origin/main
         self.state_obj.latest_demo_raw_kdr = None
         self.state_obj.latest_demo_target_kdr = None
         self.state_obj.latest_demo_corr_kdr = None
@@ -1799,12 +1763,9 @@ class GSNDashboard(tk.Tk):
                 eve_noise = self.state_obj.latest_eve_noise
                 eve_mac = self.state_obj.latest_eve_mac
                 eve_csi = None if self.state_obj.latest_eve_csi is None else self.state_obj.latest_eve_csi.copy()
-<<<<<<< HEAD
-=======
                 uav_live_serial = self.state_obj.latest_uav_live_serial
                 uav_live_csi = None if self.state_obj.latest_uav_live_csi is None else self.state_obj.latest_uav_live_csi.copy()
                 uav_live_epoch = self.state_obj.latest_uav_live_epoch
->>>>>>> refs/remotes/origin/main
                 epoch = self.state_obj.last_epoch
                 latency = self.state_obj.latest_latency_ms
                 latency_ema = self.state_obj.latest_latency_ema_ms
@@ -1852,12 +1813,9 @@ class GSNDashboard(tk.Tk):
                 "eve_noise": eve_noise,
                 "eve_mac": eve_mac,
                 "eve_csi": eve_csi,
-<<<<<<< HEAD
-=======
                 "uav_live_serial": uav_live_serial,
                 "uav_live_csi": uav_live_csi,
                 "uav_live_epoch": uav_live_epoch,
->>>>>>> refs/remotes/origin/main
                 "epoch": epoch,
                 "latency": latency,
                 "latency_ema": latency_ema,

@@ -32,19 +32,12 @@ from bch_reconciliation import bch_encode_syndrome_b64, force_102_bits
 from uav_sender import UAVKeySender
 from uav_stream import UAVVideoStreamer
 try:
-<<<<<<< HEAD
-    from demo_telemetry import DEMO_TELEMETRY_PORT, DemoTelemetrySender
-=======
     from demo_telemetry import DEMO_TELEMETRY_PORT, DemoTelemetrySender, LiveCSITelemetrySender
->>>>>>> refs/remotes/origin/main
     DEMO_TELEMETRY_IMPORT_ERROR = None
 except ImportError as exc:
     DEMO_TELEMETRY_PORT = 5009
     DemoTelemetrySender = None
-<<<<<<< HEAD
-=======
     LiveCSITelemetrySender = None
->>>>>>> refs/remotes/origin/main
     DEMO_TELEMETRY_IMPORT_ERROR = exc
 
 
@@ -70,10 +63,7 @@ TIME_SYNC_PORT = 5006
 TIME_SYNC_SAMPLES = 8
 UAV_CONTROL_PORT = 5008
 KEY_UPDATE_INTERVAL_SEC = 5.0
-<<<<<<< HEAD
-=======
 LIVE_CSI_TELEMETRY_INTERVAL_SEC = 0.05
->>>>>>> refs/remotes/origin/main
 DEMO_TELEMETRY_ENABLED = DemoTelemetrySender is not None
 KEY_SOURCE = os.environ.get("PLKG_KEY_SOURCE", "cnnq").strip().lower()
 
@@ -166,13 +156,10 @@ class KeyState:
         with self.lock:
             return self.epoch, self.aes_key
 
-<<<<<<< HEAD
-=======
     def current_epoch(self):
         with self.lock:
             return self.epoch
 
->>>>>>> refs/remotes/origin/main
     def for_demo_telemetry(self):
         with self.lock:
             raw_csi = None if self.raw_csi is None else self.raw_csi.copy()
@@ -560,9 +547,6 @@ if __name__ == "__main__":
             debug=DEBUG,
         )
         threading.Thread(target=demo_sender.run, daemon=True).start()
-<<<<<<< HEAD
-        print(f"[UAV] demo telemetry enabled on UDP/{DEMO_TELEMETRY_PORT}")
-=======
         if LiveCSITelemetrySender is not None:
             live_csi_sender = LiveCSITelemetrySender(
                 latest_uav_csi_for_telemetry,
@@ -576,7 +560,6 @@ if __name__ == "__main__":
             f"[UAV] demo telemetry enabled on UDP/{DEMO_TELEMETRY_PORT}; "
             f"live CSI interval={LIVE_CSI_TELEMETRY_INTERVAL_SEC:.3f}s"
         )
->>>>>>> refs/remotes/origin/main
     elif DEMO_TELEMETRY_IMPORT_ERROR is not None:
         print(f"[UAV] demo telemetry disabled: {DEMO_TELEMETRY_IMPORT_ERROR}")
 
