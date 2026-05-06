@@ -23,7 +23,7 @@ except Exception:
 
 cv2.setNumThreads(1)
 
-VIDEO_HEADER_PACKET = struct.Struct("!I I d I 1s ?")
+VIDEO_HEADER_PACKET = struct.Struct("!I I d I 1s ? ?")
 VIDEO_PAYLOAD_PACKET = struct.Struct("!I I")
 CODEC_H264 = b"4"
 CODEC_JPEG = b"J"
@@ -86,6 +86,7 @@ class UAVVideoStreamer:
         sync_retry_interval=1.0,
         sync_refresh_interval=15.0,
         initial_sync_timeout=3.0,
+        get_encryption_enabled=None,
     ):
         """
         get_video_key() -> (epoch, aes_key)
@@ -108,6 +109,7 @@ class UAVVideoStreamer:
         self.sync_retry_interval = sync_retry_interval
         self.sync_refresh_interval = sync_refresh_interval
         self.initial_sync_timeout = initial_sync_timeout
+        self.get_encryption_enabled = get_encryption_enabled or (lambda: True)
 
         self.preview = preview
         self.debug = debug
@@ -305,15 +307,30 @@ class UAVVideoStreamer:
         except Exception as e:
             print(f"[Cam Warning] {e}")
 
-    def _send_encoded_bytes(self, sock, frame_id, ts, encoded_bytes, aes_cipher, epoch, codec_tag, keyframe):
+    def _send_encoded_bytes(
+        self,
+        sock,
+        frame_id,
+        ts,
+        encoded_bytes,
+        aes_cipher,
+        epoch,
+        codec_tag,
+        keyframe,
+        encrypted=True,
+    ):
         corrected_ts = ts + self._get_clock_offset()
-        nonce = os.urandom(12)
-        encrypt_start = time.perf_counter()
-        encrypted = nonce + aes_cipher.encrypt(nonce, encoded_bytes, None)
-        encrypt_time_s = time.perf_counter() - encrypt_start
+        if encrypted:
+            nonce = os.urandom(12)
+            encrypt_start = time.perf_counter()
+            wire_payload = nonce + aes_cipher.encrypt(nonce, encoded_bytes, None)
+            encrypt_time_s = time.perf_counter() - encrypt_start
+        else:
+            wire_payload = encoded_bytes
+            encrypt_time_s = 0.0
         chunks = [
-            encrypted[i : i + self.chunk]
-            for i in range(0, len(encrypted), self.chunk)
+            wire_payload[i : i + self.chunk]
+            for i in range(0, len(wire_payload), self.chunk)
         ]
 
         header = b"H" + VIDEO_HEADER_PACKET.pack(
@@ -323,6 +340,7 @@ class UAVVideoStreamer:
             len(chunks),
             codec_tag,
             bool(keyframe),
+            bool(encrypted),
         )
         send_start = time.perf_counter()
         sock.sendto(header, (self.gsn_ip, self.port))
@@ -423,14 +441,19 @@ class UAVVideoStreamer:
                     continue
                 self._record_stats(jpeg_encode_time_s=encode_time_s)
 
+                encryption_enabled = bool(self.get_encryption_enabled())
                 epoch, aes_key = self.get_video_key()
-                if aes_key is None:
+                if epoch is None or epoch < 0:
+                    epoch = 0
+                if encryption_enabled and aes_key is None:
                     self._record_stats(key_wait_frames=1)
                     continue
 
-                if epoch != last_epoch or aes_cipher is None:
+                if encryption_enabled and (epoch != last_epoch or aes_cipher is None):
                     aes_cipher = AESGCM(aes_key)
                     last_epoch = epoch
+                elif not encryption_enabled:
+                    aes_cipher = None
 
                 self._send_encoded_bytes(
                     sock,
@@ -441,6 +464,7 @@ class UAVVideoStreamer:
                     epoch,
                     CODEC_JPEG,
                     True,
+                    encrypted=encryption_enabled,
                 )
 
         except Exception as e:
@@ -467,14 +491,19 @@ class UAVVideoStreamer:
                 last_seq = seq
                 frame_id += 1
 
+                encryption_enabled = bool(self.get_encryption_enabled())
                 epoch, aes_key = self.get_video_key()
-                if aes_key is None:
+                if epoch is None or epoch < 0:
+                    epoch = 0
+                if encryption_enabled and aes_key is None:
                     self._record_stats(key_wait_frames=1)
                     continue
 
-                if epoch != last_epoch or aes_cipher is None:
+                if encryption_enabled and (epoch != last_epoch or aes_cipher is None):
                     aes_cipher = AESGCM(aes_key)
                     last_epoch = epoch
+                elif not encryption_enabled:
+                    aes_cipher = None
 
                 self._send_encoded_bytes(
                     sock,
@@ -485,6 +514,7 @@ class UAVVideoStreamer:
                     epoch,
                     codec_tag,
                     keyframe,
+                    encrypted=encryption_enabled,
                 )
 
         except Exception as e:

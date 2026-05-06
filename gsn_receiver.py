@@ -16,7 +16,7 @@ except Exception:
     av = None
 
 
-VIDEO_HEADER_PACKET = struct.Struct("!I I d I 1s ?")
+VIDEO_HEADER_PACKET = struct.Struct("!I I d I 1s ? ?")
 VIDEO_PAYLOAD_PACKET = struct.Struct("!I I")
 CODEC_H264 = b"4"
 CODEC_JPEG = b"J"
@@ -55,6 +55,7 @@ class GSNReceiver:
         frame_timeout=0.4,
         sync_port=5006,
         decode_queue_size=32,
+        on_eve_frame=None,
     ):
         """
         get_aes_key(epoch) -> bytes
@@ -62,6 +63,7 @@ class GSNReceiver:
         """
         self.get_aes_key = get_aes_key
         self.on_frame = on_frame
+        self.on_eve_frame = on_eve_frame
         self.video_port = video_port
         self.frame_timeout = frame_timeout
         self.sync_port = sync_port
@@ -131,7 +133,7 @@ class GSNReceiver:
             t = data[0:1]
 
             if t == b"H":
-                fid, epoch, ts, cnt, codec_tag, keyframe = VIDEO_HEADER_PACKET.unpack(data[1:])
+                fid, epoch, ts, cnt, codec_tag, keyframe, encrypted = VIDEO_HEADER_PACKET.unpack(data[1:])
 
                 # UAV reboot/new session: frame_id or epoch rolled back.
                 if (
@@ -152,6 +154,7 @@ class GSNReceiver:
                     "ts": ts,
                     "codec": codec_tag,
                     "keyframe": keyframe,
+                    "encrypted": encrypted,
                     "pkts": {},
                     "max": cnt,
                     "created_at": now,
@@ -179,6 +182,7 @@ class GSNReceiver:
                             info["ts"],
                             info["codec"],
                             info["keyframe"],
+                            info["encrypted"],
                             blob,
                         )
                     )
@@ -220,31 +224,59 @@ class GSNReceiver:
 
         return frames[-1].to_ndarray(format="bgr24")
 
+    @staticmethod
+    def _noise_frame(reference=None):
+        if reference is not None:
+            h, w = reference.shape[:2]
+        else:
+            h, w = 360, 640
+        return np.random.randint(0, 256, (max(1, h), max(1, w), 3), dtype=np.uint8)
+
+    def _emit_eve_frame(self, frame, encrypted):
+        if self.on_eve_frame is None:
+            return
+        try:
+            self.on_eve_frame(frame, encrypted)
+        except Exception as exc:
+            print(f"[GSNReceiver] EVE frame callback error: {exc}")
+
     def _show(self):
         last_epoch = None
         aes_cipher = None
 
         while True:
-            _, epoch, ts, codec_tag, keyframe, blob = self.queue.get()
+            _, epoch, ts, codec_tag, keyframe, encrypted, blob = self.queue.get()
 
-            key = self.get_aes_key(epoch)
-            if key is None:
-                continue
+            if encrypted:
+                key = self.get_aes_key(epoch)
+                if key is None:
+                    self._emit_eve_frame(self._noise_frame(), True)
+                    continue
 
-            if epoch != last_epoch or aes_cipher is None:
-                aes_cipher = AESGCM(key)
-                last_epoch = epoch
-                self.need_h264_keyframe.set()
+                if epoch != last_epoch or aes_cipher is None:
+                    aes_cipher = AESGCM(key)
+                    last_epoch = epoch
+                    self.need_h264_keyframe.set()
 
-            nonce, cipher = blob[:12], blob[12:]
-            try:
-                payload = aes_cipher.decrypt(nonce, cipher, None)
-            except Exception:
-                continue
+                nonce, cipher = blob[:12], blob[12:]
+                try:
+                    payload = aes_cipher.decrypt(nonce, cipher, None)
+                except Exception:
+                    self._emit_eve_frame(self._noise_frame(), True)
+                    continue
+            else:
+                payload = blob
+                aes_cipher = None
+                last_epoch = None
 
             frame = self._decode_payload(codec_tag, keyframe, payload)
             if frame is None:
                 continue
+
+            if encrypted:
+                self._emit_eve_frame(self._noise_frame(frame), True)
+            else:
+                self._emit_eve_frame(frame.copy(), False)
 
             # Guard against transient future timestamps while clock sync is warming up.
             latency = max(0.0, (time.time() - ts) * 1000)

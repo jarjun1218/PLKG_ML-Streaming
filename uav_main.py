@@ -62,8 +62,11 @@ VIDEO_USE_HARDWARE_H264 = True
 TIME_SYNC_PORT = 5006
 TIME_SYNC_SAMPLES = 8
 UAV_CONTROL_PORT = 5008
-KEY_UPDATE_INTERVAL_SEC = 5.0
-LIVE_CSI_TELEMETRY_INTERVAL_SEC = 0.05
+KEY_UPDATE_INTERVAL_SEC = 10.0
+LIVE_CSI_TELEMETRY_INTERVAL_SEC = 0.5
+CSI_PAIR_WAIT_LOG_INTERVAL_SEC = 5.0
+CSI_PAIR_WAIT_RESET_LOGS = 3
+CSI_PAIR_WAIT_RESET_COOLDOWN_SEC = 20.0
 DEMO_TELEMETRY_ENABLED = DemoTelemetrySender is not None
 KEY_SOURCE = os.environ.get("PLKG_KEY_SOURCE", "cnnq").strip().lower()
 
@@ -183,6 +186,25 @@ class KeyState:
 key_state = KeyState()
 uav_csi_watcher = None
 keygen_resync_event = threading.Event()
+
+
+class VideoEncryptionState:
+    def __init__(self, enabled=True):
+        self._lock = threading.Lock()
+        self._enabled = bool(enabled)
+
+    def set_enabled(self, enabled):
+        with self._lock:
+            changed = self._enabled != bool(enabled)
+            self._enabled = bool(enabled)
+            return changed
+
+    def is_enabled(self):
+        with self._lock:
+            return self._enabled
+
+
+video_encryption_state = VideoEncryptionState(enabled=True)
 
 
 def latest_uav_csi_for_telemetry():
@@ -386,6 +408,8 @@ def keygen_thread():
     last_pair_start = None
     next_keygen_time = 0.0
     last_wait_log = 0.0
+    consecutive_pair_wait_logs = 0
+    last_forced_csi_reset = 0.0
     if KEY_SOURCE not in ("csi", "cnn", "cnnq"):
         print(f"[UAV] unknown PLKG_KEY_SOURCE={KEY_SOURCE!r}; falling back to cnnq")
         key_source = "cnnq"
@@ -404,17 +428,42 @@ def keygen_thread():
             last_serial = None
             last_pair_start = None
             next_keygen_time = 0.0
+            consecutive_pair_wait_logs = 0
+            last_wait_log = 0.0
             print("[UAV] keygen resync requested; waiting for fresh CSI")
 
         samples = watcher.samples()
         pair = select_latest_consecutive_pair(samples, last_pair_start)
         if pair is None:
             now = time.monotonic()
-            if now - last_wait_log >= 5.0:
-                print("[UAV] waiting for two consecutive local CSI samples before key generation")
+            if now - last_wait_log >= CSI_PAIR_WAIT_LOG_INTERVAL_SEC:
+                consecutive_pair_wait_logs += 1
+                print(
+                    "[UAV] waiting for two consecutive local CSI samples before key generation "
+                    f"(wait_count={consecutive_pair_wait_logs}/{CSI_PAIR_WAIT_RESET_LOGS}, "
+                    f"buffered_samples={len(samples)})"
+                )
                 last_wait_log = now
+
+                reset_due = consecutive_pair_wait_logs >= CSI_PAIR_WAIT_RESET_LOGS
+                reset_cooled_down = now - last_forced_csi_reset >= CSI_PAIR_WAIT_RESET_COOLDOWN_SEC
+                if reset_due and reset_cooled_down:
+                    print(
+                        "[UAV] no consecutive CSI samples after repeated waits; "
+                        f"forcing ESP32 CSI reset on {CSI_PORT}"
+                    )
+                    try:
+                        watcher.force_reset()
+                        last_serial = None
+                        last_pair_start = None
+                        next_keygen_time = 0.0
+                        consecutive_pair_wait_logs = 0
+                        last_forced_csi_reset = now
+                    except Exception as exc:
+                        print(f"[UAV] failed to force reset ESP32 CSI reader: {exc}")
             time.sleep(0.05)
             continue
+        consecutive_pair_wait_logs = 0
 
         now = time.monotonic()
         if now < next_keygen_time:
@@ -509,6 +558,26 @@ def control_thread():
     while True:
         data, addr = sock.recvfrom(1024)
         cmd = data.decode(errors="ignore").strip()
+
+        if cmd.startswith("VIDEO_ENCRYPTION"):
+            parts = cmd.split()
+            if len(parts) < 2:
+                print(f"[UAV] invalid VIDEO_ENCRYPTION command from {addr[0]}: {cmd!r}")
+                continue
+            value = parts[1].strip().lower()
+            if value in ("1", "on", "true", "enabled", "encrypt", "encrypted"):
+                enabled = True
+            elif value in ("0", "off", "false", "disabled", "plain", "plaintext"):
+                enabled = False
+            else:
+                print(f"[UAV] invalid VIDEO_ENCRYPTION value from {addr[0]}: {value!r}")
+                continue
+            changed = video_encryption_state.set_enabled(enabled)
+            state = "ENCRYPTED" if enabled else "PLAINTEXT"
+            suffix = "" if changed else " (unchanged)"
+            print(f"[UAV] video transmission mode set to {state} by {addr[0]}{suffix}")
+            continue
+
         if cmd != "RESET_CSI":
             continue
 
@@ -581,6 +650,7 @@ if __name__ == "__main__":
         use_hardware_h264=VIDEO_USE_HARDWARE_H264,
         sync_port=TIME_SYNC_PORT,
         sync_samples=TIME_SYNC_SAMPLES,
+        get_encryption_enabled=video_encryption_state.is_enabled,
     )
 
     print("[UAV] system ready (press q to quit preview)")
