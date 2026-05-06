@@ -238,7 +238,7 @@ class DemoTelemetrySender:
             for _ in range(repeat_count):
                 sock.sendto(msg, (self.gsn_ip, self.port))
                 time.sleep(0.01)
-            if self.debug or epoch != last_epoch:
+            if self.debug:
                 print(
                     f"[UAV] send demo telemetry epoch={epoch} "
                     f"serial={serial} to {self.gsn_ip}:{self.port}"

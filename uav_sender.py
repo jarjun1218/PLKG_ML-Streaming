@@ -58,10 +58,11 @@ class UAVKeySender:
             for _ in range(repeat_count):
                 sock.sendto(msg.encode(), (self.gsn_ip, self.port))
                 time.sleep(0.01)
-            print(
-                f"[UAV] send helper+confirm epoch={epoch} "
-                f"serial={serial} to {self.gsn_ip}:{self.port}"
-            )
+            if self.debug:
+                print(
+                    f"[UAV] send helper+confirm epoch={epoch} "
+                    f"serial={serial} to {self.gsn_ip}:{self.port}"
+                )
 
             last_epoch = epoch
             last_send_time = time.time()
