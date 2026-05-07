@@ -1805,6 +1805,10 @@ class GSNDashboard(tk.Tk):
             self.log(f"Failed to send video encryption toggle: {e}")
         self._sync_encrypt_button()
 
+    def _send_key_ack(self, uav_ip, epoch, serial_token, confirm):
+        command = f"KEY_ACK {int(epoch)} {serial_token} {confirm}".encode("ascii")
+        self._send_uav_control(command, target_ip=uav_ip)
+
     def _sync_encrypt_button(self):
         with self.state_obj.lock:
             enabled = self.state_obj.video_encryption_enabled
@@ -2119,8 +2123,13 @@ class GSNDashboard(tk.Tk):
                     self.log(eve_message)
 
                 with self.state_obj.lock:
-                    if epoch in self.state_obj.keys_by_epoch:
-                        continue
+                    already_ready = epoch in self.state_obj.keys_by_epoch
+                if already_ready:
+                    try:
+                        self._send_key_ack(addr[0], epoch, serial_token, confirm)
+                    except Exception as exc:
+                        self.log(f"Failed to resend KEY_ACK for epoch={epoch}: {exc}")
+                    continue
                 if epoch in rejected_epochs:
                     continue
 
@@ -2186,10 +2195,8 @@ class GSNDashboard(tk.Tk):
                 if not verify_key_confirm(aes, epoch, serial_token, helper, confirm):
                     rejected_epochs.add(epoch)
                     with self.state_obj.lock:
-                        self.state_obj.video_status = "Key confirmation failed. Waiting for next epoch."
+                        self.state_obj.video_status = "Pending key confirmation failed. Keeping previous video key."
                         self.state_obj.video_status_level = "warn"
-                        self.state_obj.last_epoch = None
-                        self.state_obj.active_key = None
                     self.log(f"Key confirmation failed for epoch={epoch}, serials={serial_pair_label(serial_pair)}.")
                     continue
 
@@ -2216,13 +2223,18 @@ class GSNDashboard(tk.Tk):
                     self.state_obj.latest_kdr_corr = None
                     self.state_obj.kdr_raw_hist.append(raw_kdr)
                     self.state_obj.hist_idx += 1
+                try:
+                    self._send_key_ack(addr[0], epoch, serial_token, confirm)
+                    self.log(f"Sent KEY_ACK epoch={epoch} serials={serial_pair_label(serial_pair)} to {addr[0]}.")
+                except Exception as exc:
+                    self.log(f"Failed to send KEY_ACK for epoch={epoch}: {exc}")
                 if demo_snapshot:
                     self.log(
                         f"[KEY ACTIVE] epoch={epoch} serial={serial} "
                         f"serials={serial_pair_label(serial_pair)} "
                         f"raw_kdr={demo_snapshot['raw_kdr']:.2f}% "
-                        f"active_target_kdr={demo_snapshot['active_target_kdr']:.2f}% "
-                        f"corrected_kdr={demo_snapshot['corrected_kdr']:.2f}% "
+                        f"cnn_kdr={fmt_pct(demo_snapshot.get('cnn_kdr'))} "
+                        f"cnnq_kdr={fmt_pct(demo_snapshot.get('cnnq_kdr'))} "
                         f"correction_bits={raw_kdr:.2f}%"
                     )
                 else:

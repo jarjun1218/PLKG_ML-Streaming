@@ -36,7 +36,7 @@ class UAVKeySender:
             now = time.time()
             if epoch < 0 or serial is None or helper is None or confirm is None:
                 if now - last_wait_log >= 5.0:
-                    print("[UAV] waiting for key material before sending helper")
+                    print("[UAV] waiting for pending key material before sending helper")
                     last_wait_log = now
                 time.sleep(0.05)
                 continue

@@ -4,11 +4,11 @@ uav_main.py
 
 Default key agreement path:
 1. CSI preprocessing -> wait for two consecutive UAV CSI samples
-2. [raw key serial N, raw key serial N+1] -> CNN-Q -> active UAV key
-3. active key -> BCH syndrome helper -> send (epoch, CSI serial pair, helper)
+2. [raw key serial N, raw key serial N+1] -> CNN-Q -> pending UAV key
+3. pending key -> BCH syndrome helper -> send (epoch, CSI serial pair, helper)
 4. GSN waits for the same serial pair, then corrects its serial N raw key
-5. active/corrected key -> SHA256 -> AES key
-6. AES key -> HMAC key confirmation
+5. GSN verifies HMAC key confirmation and sends KEY_ACK
+6. UAV promotes pending key to active video key only after KEY_ACK
 """
 
 import threading
@@ -65,6 +65,7 @@ TIME_SYNC_PORT = 5006
 TIME_SYNC_SAMPLES = 8
 UAV_CONTROL_PORT = 5008
 KEY_UPDATE_INTERVAL_SEC = 10.0
+KEY_ACK_TIMEOUT_SEC = float(os.environ.get("PLKG_KEY_ACK_TIMEOUT_SEC", "12.0"))
 LIVE_CSI_TELEMETRY_INTERVAL_SEC = 0.5
 CSI_PAIR_WAIT_LOG_INTERVAL_SEC = 5.0
 CSI_PAIR_WAIT_RESET_LOGS = 3
@@ -83,6 +84,7 @@ class KeyState:
     def __init__(self):
         self.lock = threading.Lock()
         self.epoch = -1
+        self.next_epoch = 0
         self.serial = None         # first CSI serial used for this key
         self.serial_pair = None    # two consecutive CSI serials used by CNN/CNN-Q
         self.serial_token = None   # encoded serial pair sent to GSN
@@ -100,8 +102,15 @@ class KeyState:
         self.corrected_key = None  # active key selected for BCH/AES
         self.live_cnn_csi = None
         self.live_cnn_serial_pair = None
+        self.pending = None
 
-    def update(
+    @staticmethod
+    def _normalize_pair(serial_pair):
+        if isinstance(serial_pair, (tuple, list)):
+            return tuple(int(item) for item in serial_pair)
+        return (int(serial_pair),)
+
+    def _snapshot_from_args(
         self,
         serial_pair,
         helper,
@@ -116,35 +125,123 @@ class KeyState:
         cnnq_key=None,
         corrected_key=None,
     ):
-        if isinstance(serial_pair, (tuple, list)):
-            pair = tuple(int(item) for item in serial_pair)
-        else:
-            pair = (int(serial_pair),)
+        pair = self._normalize_pair(serial_pair)
         serial_token = ",".join(str(item) for item in pair)
+        return {
+            "serial": pair[0],
+            "serial_pair": pair,
+            "serial_token": serial_token,
+            "helper": helper,
+            "aes_key": aes_key,
+            "rssi": [rssi] if rssi is not None and not isinstance(rssi, (list, tuple)) else rssi,
+            "raw_csi": None if raw_csi is None else np.asarray(raw_csi, dtype=np.float32).copy(),
+            "raw_csi_2": None if raw_csi_2 is None else np.asarray(raw_csi_2, dtype=np.float32).copy(),
+            "raw_key": raw_key,
+            "raw_key_2": raw_key_2,
+            "cnn_csi": None if cnn_csi is None else np.asarray(cnn_csi, dtype=np.float32).copy(),
+            "cnn_key": cnn_key,
+            "cnnq_key": cnnq_key,
+            "corrected_key": corrected_key,
+        }
+
+    def stage_pending(
+        self,
+        serial_pair,
+        helper,
+        aes_key,
+        rssi=None,
+        raw_csi=None,
+        raw_csi_2=None,
+        raw_key=None,
+        raw_key_2=None,
+        cnn_csi=None,
+        cnn_key=None,
+        cnnq_key=None,
+        corrected_key=None,
+    ):
+        snapshot = self._snapshot_from_args(
+            serial_pair,
+            helper,
+            aes_key,
+            rssi=rssi,
+            raw_csi=raw_csi,
+            raw_csi_2=raw_csi_2,
+            raw_key=raw_key,
+            raw_key_2=raw_key_2,
+            cnn_csi=cnn_csi,
+            cnn_key=cnn_key,
+            cnnq_key=cnnq_key,
+            corrected_key=corrected_key,
+        )
 
         with self.lock:
-            self.epoch += 1
-            self.serial = pair[0]
-            self.serial_pair = pair
-            self.serial_token = serial_token
-            self.helper = helper
-            self.confirm = make_key_confirm(aes_key, self.epoch, serial_token, helper)
-            self.aes_key = aes_key
-            self.rssi = [rssi] if rssi is not None and not isinstance(rssi, (list, tuple)) else rssi
-            self.raw_csi = None if raw_csi is None else np.asarray(raw_csi, dtype=np.float32).copy()
-            self.raw_csi_2 = None if raw_csi_2 is None else np.asarray(raw_csi_2, dtype=np.float32).copy()
-            self.raw_key = raw_key
-            self.raw_key_2 = raw_key_2
-            self.cnn_csi = None if cnn_csi is None else np.asarray(cnn_csi, dtype=np.float32).copy()
-            self.cnn_key = cnn_key
-            self.cnnq_key = cnnq_key
-            self.corrected_key = corrected_key
-            self.live_cnn_csi = None if cnn_csi is None else np.asarray(cnn_csi, dtype=np.float32).copy()
-            self.live_cnn_serial_pair = pair
+            if self.pending is not None:
+                return None
+            pending_epoch = self.next_epoch
+            self.next_epoch += 1
+            snapshot["epoch"] = pending_epoch
+            snapshot["confirm"] = make_key_confirm(
+                snapshot["aes_key"],
+                pending_epoch,
+                snapshot["serial_token"],
+                snapshot["helper"],
+            )
+            snapshot["created_at"] = time.monotonic()
+            self.pending = snapshot
+            self.live_cnn_csi = None if snapshot["cnn_csi"] is None else snapshot["cnn_csi"].copy()
+            self.live_cnn_serial_pair = snapshot["serial_pair"]
+            return pending_epoch
+
+    def activate_pending_ack(self, epoch, serial_token, confirm):
+        with self.lock:
+            if self.pending is None:
+                return False, "no pending key"
+            pending = self.pending
+            if int(epoch) != pending["epoch"]:
+                return False, f"pending epoch mismatch ({pending['epoch']} != {epoch})"
+            if str(serial_token) != pending["serial_token"]:
+                return False, "pending serial token mismatch"
+            if str(confirm) != pending["confirm"]:
+                return False, "pending confirm tag mismatch"
+
+            self.epoch = pending["epoch"]
+            self.serial = pending["serial"]
+            self.serial_pair = pending["serial_pair"]
+            self.serial_token = pending["serial_token"]
+            self.helper = pending["helper"]
+            self.confirm = pending["confirm"]
+            self.aes_key = pending["aes_key"]
+            self.rssi = pending["rssi"]
+            self.raw_csi = None if pending["raw_csi"] is None else pending["raw_csi"].copy()
+            self.raw_csi_2 = None if pending["raw_csi_2"] is None else pending["raw_csi_2"].copy()
+            self.raw_key = pending["raw_key"]
+            self.raw_key_2 = pending["raw_key_2"]
+            self.cnn_csi = None if pending["cnn_csi"] is None else pending["cnn_csi"].copy()
+            self.cnn_key = pending["cnn_key"]
+            self.cnnq_key = pending["cnnq_key"]
+            self.corrected_key = pending["corrected_key"]
+            self.pending = None
+            return True, f"activated epoch {self.epoch}"
+
+    def expire_pending(self, timeout_sec):
+        with self.lock:
+            if self.pending is None:
+                return None
+            age = time.monotonic() - self.pending["created_at"]
+            if age < timeout_sec:
+                return None
+            expired = self.pending
+            self.pending = None
+            return expired
+
+    def has_pending(self):
+        with self.lock:
+            return self.pending is not None
 
     def invalidate(self):
         with self.lock:
             self.epoch = -1
+            self.next_epoch = 0
             self.serial = None
             self.serial_pair = None
             self.serial_token = None
@@ -162,10 +259,18 @@ class KeyState:
             self.corrected_key = None
             self.live_cnn_csi = None
             self.live_cnn_serial_pair = None
+            self.pending = None
 
     def for_reconciliation(self):
         with self.lock:
-            return self.epoch, self.serial_token, self.helper, self.confirm
+            if self.pending is None:
+                return -1, None, None, None
+            return (
+                self.pending["epoch"],
+                self.pending["serial_token"],
+                self.pending["helper"],
+                self.pending["confirm"],
+            )
 
     def for_video(self):
         with self.lock:
@@ -193,22 +298,42 @@ class KeyState:
 
     def for_demo_telemetry(self):
         with self.lock:
-            raw_csi = None if self.raw_csi is None else self.raw_csi.copy()
-            raw_csi_2 = None if self.raw_csi_2 is None else self.raw_csi_2.copy()
-            cnn_csi = None if self.cnn_csi is None else self.cnn_csi.copy()
+            source = self.pending
+            if source is None:
+                raw_csi = None if self.raw_csi is None else self.raw_csi.copy()
+                raw_csi_2 = None if self.raw_csi_2 is None else self.raw_csi_2.copy()
+                cnn_csi = None if self.cnn_csi is None else self.cnn_csi.copy()
+                return (
+                    self.epoch,
+                    self.serial,
+                    self.rssi,
+                    raw_csi,
+                    self.raw_key,
+                    self.corrected_key,
+                    cnn_csi,
+                    self.cnn_key,
+                    self.cnnq_key,
+                    self.serial_pair,
+                    raw_csi_2,
+                    self.raw_key_2,
+                )
+
+            raw_csi = None if source["raw_csi"] is None else source["raw_csi"].copy()
+            raw_csi_2 = None if source["raw_csi_2"] is None else source["raw_csi_2"].copy()
+            cnn_csi = None if source["cnn_csi"] is None else source["cnn_csi"].copy()
             return (
-                self.epoch,
-                self.serial,
-                self.rssi,
+                source["epoch"],
+                source["serial"],
+                source["rssi"],
                 raw_csi,
-                self.raw_key,
-                self.corrected_key,
+                source["raw_key"],
+                source["corrected_key"],
                 cnn_csi,
-                self.cnn_key,
-                self.cnnq_key,
-                self.serial_pair,
+                source["cnn_key"],
+                source["cnnq_key"],
+                source["serial_pair"],
                 raw_csi_2,
-                self.raw_key_2,
+                source["raw_key_2"],
             )
 
 
@@ -470,6 +595,18 @@ def keygen_thread():
             last_wait_log = 0.0
             print("[UAV] keygen resync requested; waiting for fresh CSI")
 
+        expired_pending = key_state.expire_pending(KEY_ACK_TIMEOUT_SEC)
+        if expired_pending is not None:
+            print(
+                f"[UAV] pending key epoch={expired_pending['epoch']} "
+                f"serial_pair={expired_pending['serial_token']} timed out before GSN ACK; "
+                "keeping previous active video key"
+            )
+
+        if key_state.has_pending():
+            time.sleep(0.05)
+            continue
+
         samples = watcher.samples()
         pair = select_latest_consecutive_pair(samples, last_pair_start)
         if pair is None:
@@ -562,8 +699,8 @@ def keygen_thread():
         # === Step 5: privacy amplification / AES-256 key ===
         aes_key = sha256.sha_byte(target_key)
 
-        # === Step 6: key confirmation tag ===
-        key_state.update(
+        # === Step 6: stage pending key; video keeps using the previous active key until GSN ACK ===
+        pending_epoch = key_state.stage_pending(
             (serial_1, serial_2),
             helper,
             aes_key,
@@ -577,6 +714,9 @@ def keygen_thread():
             cnnq_key=cnnq_key,
             corrected_key=target_key,
         )
+        if pending_epoch is None:
+            time.sleep(0.05)
+            continue
         next_keygen_time = time.monotonic() + KEY_UPDATE_INTERVAL_SEC
         direct_to_cnn = hamming_distance(direct_key, cnn_key)
         direct_to_cnnq = hamming_distance(direct_key, cnnq_key)
@@ -584,9 +724,9 @@ def keygen_thread():
         if direct_to_cnn is not None and direct_to_cnnq is not None:
             diag = f" direct-vs-cnn={direct_to_cnn}/102 direct-vs-cnnq={direct_to_cnnq}/102"
         print(
-            f"[UAV] new key epoch={key_state.epoch} "
+            f"[UAV] pending key epoch={pending_epoch} "
             f"serial_pair={serial_1},{serial_2} source={key_source}{diag} "
-            f"(next update in {KEY_UPDATE_INTERVAL_SEC:.1f}s)"
+            "waiting for GSN ACK before switching video key"
         )
 
 
@@ -598,6 +738,23 @@ def control_thread():
     while True:
         data, addr = sock.recvfrom(1024)
         cmd = data.decode(errors="ignore").strip()
+
+        if cmd.startswith("KEY_ACK"):
+            parts = cmd.split()
+            if len(parts) != 4:
+                print(f"[UAV] invalid KEY_ACK command from {addr[0]}: {cmd!r}")
+                continue
+            try:
+                epoch = int(parts[1])
+            except ValueError:
+                print(f"[UAV] invalid KEY_ACK epoch from {addr[0]}: {parts[1]!r}")
+                continue
+            ok, message = key_state.activate_pending_ack(epoch, parts[2], parts[3])
+            if ok:
+                print(f"[UAV] GSN confirmed pending key; {message}")
+            else:
+                print(f"[UAV] ignored KEY_ACK from {addr[0]}: {message}")
+            continue
 
         if cmd.startswith("VIDEO_ENCRYPTION"):
             parts = cmd.split()
