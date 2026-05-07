@@ -163,6 +163,12 @@ class KeyState:
         with self.lock:
             return self.epoch
 
+    def current_cnn_csi(self):
+        with self.lock:
+            cnn_csi = None if self.cnn_csi is None else self.cnn_csi.copy()
+            serial_pair = None if self.serial_pair is None else tuple(self.serial_pair)
+            return cnn_csi, serial_pair
+
     def for_demo_telemetry(self):
         with self.lock:
             raw_csi = None if self.raw_csi is None else self.raw_csi.copy()
@@ -217,7 +223,14 @@ def latest_uav_csi_for_telemetry():
     csi = snap.get("csi")
     if csi is None:
         return None
-    return snap.get("serial"), np.asarray(csi, dtype=np.float32).copy(), key_state.current_epoch()
+    cnn_csi, cnn_serial_pair = key_state.current_cnn_csi()
+    return (
+        snap.get("serial"),
+        np.asarray(csi, dtype=np.float32).copy(),
+        key_state.current_epoch(),
+        cnn_csi,
+        cnn_serial_pair,
+    )
 
 
 # ======================================================

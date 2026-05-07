@@ -148,6 +148,8 @@ class GSNState:
     latest_demo_telemetry_time: float | None = None
     latest_uav_live_serial: int | None = None
     latest_uav_live_csi: np.ndarray | None = None
+    latest_uav_live_cnn_csi: np.ndarray | None = None
+    latest_uav_live_cnn_serial_pair: tuple | None = None
     latest_uav_live_epoch: int | None = None
     latest_uav_live_csi_time: float | None = None
 
@@ -365,10 +367,7 @@ class VideoModulePanel(ModulePanel):
             dashboard,
             key,
             title,
-            {
-                "video": "GSN Video",
-                "eve_video": "EVE View",
-            },
+            {"video": "UAV / EVE View"},
             default_content,
         )
         self.video_photo = None
@@ -421,45 +420,161 @@ class VideoModulePanel(ModulePanel):
         self.viewport.place_configure(width=target_w, height=target_h)
         self.render()
 
+    @staticmethod
+    def _placeholder_pip(width, height, text):
+        pip = np.zeros((max(1, height), max(1, width), 3), dtype=np.uint8)
+        pip[:] = (24, 31, 45)
+        cv2.putText(
+            pip,
+            text,
+            (10, max(28, height // 2)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (203, 213, 225),
+            1,
+            cv2.LINE_AA,
+        )
+        return pip
+
+    def _compose_with_eve_pip(self, frame):
+        disp = frame.copy()
+        h, w = disp.shape[:2]
+        if h <= 0 or w <= 0:
+            return disp
+
+        eve_frame = self.snapshot.get("eve_video_frame")
+        encrypted = self.snapshot.get("eve_video_encrypted")
+        encryption_enabled = bool(self.snapshot.get("video_encryption_enabled", True))
+        eve_time = self.snapshot.get("eve_video_time")
+        eve_is_fresh = eve_time is not None and time.time() - eve_time <= 1.5
+
+        pip_w = int(w * 0.28)
+        pip_w = max(180, min(pip_w, 340, int(w * 0.42)))
+        pip_h = int(pip_w / VIDEO_VIEWPORT_ASPECT)
+        pip_h = max(105, min(pip_h, int(h * 0.42)))
+        pip_w = max(1, min(pip_w, w - 24))
+        pip_h = max(1, min(pip_h, h - 24))
+
+        if eve_frame is None or not eve_is_fresh:
+            pip = self._placeholder_pip(pip_w, pip_h, "EVE waiting")
+            label = "EVE"
+            color = (203, 213, 225)
+        else:
+            pip = cv2.resize(eve_frame, (pip_w, pip_h))
+            if encrypted:
+                label = "EVE: noise"
+                color = (80, 180, 255)
+            else:
+                label = "EVE: video"
+                color = (80, 255, 180)
+
+        margin = max(12, int(min(w, h) * 0.025))
+        x1 = max(0, w - pip_w - margin)
+        y1 = max(0, h - pip_h - margin)
+        x2 = min(w, x1 + pip_w)
+        y2 = min(h, y1 + pip_h)
+        pip = pip[: y2 - y1, : x2 - x1]
+
+        border = 3
+        cv2.rectangle(
+            disp,
+            (max(0, x1 - border), max(0, y1 - border)),
+            (min(w - 1, x2 + border), min(h - 1, y2 + border)),
+            color,
+            border,
+        )
+        disp[y1:y2, x1:x2] = pip
+
+        label_h = 26
+        overlay = disp.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, min(y2, y1 + label_h)), (2, 6, 23), -1)
+        cv2.addWeighted(overlay, 0.68, disp, 0.32, 0, disp)
+        cv2.putText(
+            disp,
+            label,
+            (x1 + 8, y1 + 19),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+        mode = "Encrypted" if encryption_enabled else "Plaintext"
+        # cv2.putText(
+        #     disp,
+        #     mode,
+        #     (10, max(28, h - 16)),
+        #     cv2.FONT_HERSHEY_SIMPLEX,
+        #     0.65,
+        #     (226, 232, 240),
+        #     2,
+        #     cv2.LINE_AA,
+        # )
+        return disp
+
+    def _present_bgr_frame(self, disp, hint, level):
+        disp = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+        h, w = disp.shape[:2]
+        max_w, max_h = self.viewport_size
+        scale = min(max_w / max(w, 1), max_h / max(h, 1))
+        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        disp = cv2.resize(disp, new_size)
+        img = Image.fromarray(disp)
+        self.video_photo = ImageTk.PhotoImage(img)
+        self.video_label.config(image=self.video_photo, text="")
+        self.video_label.place(relx=0.5, rely=0.5, anchor="center")
+        self.video_hint.config(text=hint, style=self.dashboard.video_hint_style(level))
+
+    @staticmethod
+    def _draw_stalled_overlay(disp):
+        h, w = disp.shape[:2]
+        overlay = disp.copy()
+        box_w = min(max(360, int(w * 0.46)), max(1, w - 32))
+        box_h = 82
+        x1 = max(12, (w - box_w) // 2)
+        y1 = max(12, int(h * 0.12))
+        x2 = min(w - 12, x1 + box_w)
+        y2 = min(h - 12, y1 + box_h)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (2, 6, 23), -1)
+        cv2.addWeighted(overlay, 0.72, disp, 0.28, 0, disp)
+        cv2.rectangle(disp, (x1, y1), (x2, y2), (251, 113, 133), 2)
+        cv2.putText(
+            disp,
+            "Video stalled",
+            (x1 + 18, y1 + 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.82,
+            (251, 113, 133),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            disp,
+            "Waiting for UAV stream recovery",
+            (x1 + 18, y1 + 62),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (226, 232, 240),
+            1,
+            cv2.LINE_AA,
+        )
+        return disp
+
     def render(self):
         if self.card is None:
             return
 
-        is_eve_view = self.content_key == "eve_video"
-        if is_eve_view:
-            frame = self.snapshot.get("eve_video_frame")
-            latency = None
-            frame_time = self.snapshot.get("eve_video_time")
-            encrypted = self.snapshot.get("eve_video_encrypted")
-            encryption_enabled = bool(self.snapshot.get("video_encryption_enabled", True))
-            if encrypted is True:
-                video_status = "EVE cannot decrypt the encrypted stream; showing ciphertext noise."
-                video_status_level = "bad"
-            elif encrypted is False:
-                video_status = "Video encryption is OFF; EVE can decode the plaintext stream."
-                video_status_level = "warn"
-            elif encryption_enabled:
-                video_status = "Waiting for encrypted frames to demonstrate EVE noise."
-                video_status_level = "idle"
-            else:
-                video_status = "Waiting for plaintext frames to demonstrate EVE access."
-                video_status_level = "idle"
-            aes_key = True
-        else:
-            frame = self.snapshot.get("frame")
-            latency = self.snapshot.get("latency_ema")
-            frame_time = self.snapshot.get("frame_time")
-            aes_key = self.snapshot.get("aes_key")
-            video_status = self.snapshot.get("video_status") or "Waiting for UAV video stream."
-            video_status_level = self.snapshot.get("video_status_level") or "idle"
+        frame = self.snapshot.get("frame")
+        latency = self.snapshot.get("latency_ema")
+        frame_time = self.snapshot.get("frame_time")
+        aes_key = self.snapshot.get("aes_key")
+        video_status = self.snapshot.get("video_status") or "Waiting for UAV video stream."
+        video_status_level = self.snapshot.get("video_status_level") or "idle"
         now = time.time()
 
         if frame is None:
-            if is_eve_view:
-                text = "Waiting for EVE view..."
-                hint = video_status
-                level = video_status_level
-            elif aes_key is not None:
+            if aes_key is not None:
                 text = "Key synced.\nWaiting for fresh UAV video..."
                 hint = "The key is ready. Waiting for the UAV to send a new decodable frame."
                 level = "warn"
@@ -476,28 +591,15 @@ class VideoModulePanel(ModulePanel):
             return
 
         if frame_time is not None and now - frame_time > 1.0:
-            self.video_label.config(image="", text="Video stalled.\nWaiting for UAV stream recovery...")
-            self.video_label.place(relx=0.5, rely=0.5, anchor="center")
-            self.video_hint.config(text=video_status, style=self.dashboard.video_hint_style("bad"))
+            disp = self._compose_with_eve_pip(frame)
+            disp = self._draw_stalled_overlay(disp)
+            self._present_bgr_frame(disp, video_status, "bad")
             return
 
-        disp = frame.copy()
-        if is_eve_view:
-            label = "EVE: encrypted noise" if self.snapshot.get("eve_video_encrypted") else "EVE: plaintext video"
-            cv2.putText(disp, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        elif latency is not None:
+        disp = self._compose_with_eve_pip(frame)
+        if latency is not None:
             cv2.putText(disp, f"Latency={latency:.1f} ms", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        disp = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
-        h, w = disp.shape[:2]
-        max_w, max_h = self.viewport_size
-        scale = min(max_w / max(w, 1), max_h / max(h, 1))
-        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
-        disp = cv2.resize(disp, new_size)
-        img = Image.fromarray(disp)
-        self.video_photo = ImageTk.PhotoImage(img)
-        self.video_label.config(image=self.video_photo, text="")
-        self.video_label.place(relx=0.5, rely=0.5, anchor="center")
-        self.video_hint.config(text=video_status, style=self.dashboard.video_hint_style(video_status_level))
+        self._present_bgr_frame(disp, video_status, video_status_level)
 
 
 class TextModulePanel(ModulePanel):
@@ -779,6 +881,7 @@ class ChartModulePanel(ModulePanel):
         elif self.content_key == "live_csi":
             series = [
                 ("UAV live CSI", self.snapshot.get("uav_live_csi")),
+                ("UAV CNN CSI", self.snapshot.get("uav_live_cnn_csi")),
                 ("GSN live CSI", self.snapshot.get("gsn_live_csi")),
                 ("EVE live CSI", self.snapshot.get("eve_csi")),
             ]
@@ -962,7 +1065,10 @@ class GSNDashboard(tk.Tk):
         self.panel_hosts = {}
         self.panels = {}
         self.panel_visibility_vars = {}
+        self.panel_menu_labels = {}
+        self.layout_presets = []
         self.default_hosts = {}
+        self.active_top_dropdown = None
 
         self._configure_style()
         self._build_layout()
@@ -989,7 +1095,6 @@ class GSNDashboard(tk.Tk):
         style.configure("SectionMeta.TLabel", background=CARD_BG, foreground=TEXT_SOFT, font=("Arial", 8))
         style.configure("Badge.TLabel", background=CARD_BG_ALT, foreground=TEXT_MUTED, font=("Arial", 8, "bold"))
         style.configure("TButton", font=("Arial", 10, "bold"), padding=(9, 6))
-        style.configure("TMenubutton", font=("Arial", 10, "bold"), padding=(7, 5))
         style.configure("StatusIdle.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Arial", 10, "bold"))
         style.configure("StatusWarn.TLabel", background=CARD_BG, foreground=ACCENT_AMBER, font=("Arial", 10, "bold"))
         style.configure("StatusGood.TLabel", background=CARD_BG, foreground=ACCENT_GREEN, font=("Arial", 10, "bold"))
@@ -1063,10 +1168,11 @@ class GSNDashboard(tk.Tk):
         self.reset_layout_btn = ttk.Button(controls, text="Reset", command=self.reset_layout)
         self.reset_layout_btn.pack(side="left", padx=(0, 9))
         tk.Frame(controls, bg=CARD_BORDER_SOFT, width=1, height=26).pack(side="left", padx=(0, 9), pady=2)
-        self.panel_menu_button = ttk.Menubutton(controls, text="Modules")
+        self.panel_menu_button = ttk.Button(controls, text="Modules", command=self._toggle_panel_dropdown)
         self.panel_menu_button.pack(side="left", padx=(0, 6))
-        self.layout_menu_button = ttk.Menubutton(controls, text="Presets")
+        self.layout_menu_button = ttk.Button(controls, text="Presets", command=self._toggle_layout_dropdown)
         self.layout_menu_button.pack(side="left")
+        self.top_dropdown_shell = tk.Frame(topbar, bg=CARD_BG, padx=14)
 
         self.stats_strip = StatsStrip(root)
 
@@ -1114,7 +1220,6 @@ class GSNDashboard(tk.Tk):
         self.default_hosts = {
             "media_main": self.panel_hosts["primary"],
             "control_panel": self.panel_hosts["auxiliary"],
-            "eve_video": self.panel_hosts["auxiliary"],
             "text_main": self.panel_hosts["analytics_left"],
             "text_aux": self.panel_hosts["footer"],
             "chart_main": self.panel_hosts["secondary"],
@@ -1129,7 +1234,6 @@ class GSNDashboard(tk.Tk):
     def _init_panels(self):
         self.panels = {
             "media_main": VideoModulePanel(self, "media_main", "Decrypted Video", "video"),
-            "eve_video": VideoModulePanel(self, "eve_video", "EVE View", "eve_video"),
             "control_panel": ControlModulePanel(self, "control_panel", "System State", "session"),
             "text_main": TextModulePanel(self, "text_main", "Demo Key Snapshot", "demo_keys"),
             "text_aux": TextModulePanel(self, "text_aux", "Epoch History", "epoch_history"),
@@ -1139,7 +1243,6 @@ class GSNDashboard(tk.Tk):
         }
         self.default_visible_panels = {
             "media_main": True,
-            "eve_video": True,
             "control_panel": False,
             "text_main": True,
             "text_aux": False,
@@ -1153,10 +1256,8 @@ class GSNDashboard(tk.Tk):
                 panel.show()
 
     def _init_panel_menu(self):
-        menu = tk.Menu(self.panel_menu_button, tearoff=False)
-        labels = {
+        self.panel_menu_labels = {
             "media_main": "Decrypted Video",
-            "eve_video": "EVE View",
             "control_panel": "System State",
             "text_main": "Demo Key Snapshot",
             "text_aux": "Epoch History",
@@ -1164,20 +1265,106 @@ class GSNDashboard(tk.Tk):
             "chart_aux": "Live CSI",
             "text_log": "System Log",
         }
-        for key, label in labels.items():
+        for key in self.panel_menu_labels:
             var = tk.BooleanVar(value=self.panels[key].visible)
             self.panel_visibility_vars[key] = var
-            menu.add_checkbutton(label=label, variable=var, command=lambda k=key: self.toggle_panel(k))
-        self.panel_menu_button["menu"] = menu
 
     def _init_layout_menu(self):
-        menu = tk.Menu(self.layout_menu_button, tearoff=False)
-        menu.add_command(label="Auto Detect", command=self.apply_auto_layout_preset)
-        menu.add_command(label="Balanced", command=lambda: self.apply_layout_preset("balanced"))
-        menu.add_command(label="Wide Video", command=lambda: self.apply_layout_preset("wide_video"))
-        menu.add_command(label="Focus Video", command=lambda: self.apply_layout_preset("focus_video"))
-        menu.add_command(label="Analysis", command=lambda: self.apply_layout_preset("analysis"))
-        self.layout_menu_button["menu"] = menu
+        self.layout_presets = [
+            ("Auto Detect", None),
+            ("Balanced", "balanced"),
+            ("Wide Video", "wide_video"),
+            ("Focus Video", "focus_video"),
+            ("Analysis", "analysis"),
+        ]
+
+    def _toggle_panel_dropdown(self):
+        if self.active_top_dropdown == "modules" and self.top_dropdown_shell.winfo_ismapped():
+            self._hide_top_dropdown()
+            return
+        self._show_panel_dropdown()
+
+    def _toggle_layout_dropdown(self):
+        if self.active_top_dropdown == "presets" and self.top_dropdown_shell.winfo_ismapped():
+            self._hide_top_dropdown()
+            return
+        self._show_layout_dropdown()
+
+    def _prepare_top_dropdown(self, dropdown_name):
+        for child in self.top_dropdown_shell.winfo_children():
+            child.destroy()
+        self.active_top_dropdown = dropdown_name
+        if not self.top_dropdown_shell.winfo_ismapped():
+            self.top_dropdown_shell.pack(fill="x", pady=(0, 9))
+        container = tk.Frame(
+            self.top_dropdown_shell,
+            bg=CARD_BG_ALT,
+            highlightthickness=1,
+            highlightbackground=CARD_BORDER_SOFT,
+            bd=0,
+            padx=8,
+            pady=6,
+        )
+        container.pack(side="right")
+        return container
+
+    def _hide_top_dropdown(self):
+        for child in self.top_dropdown_shell.winfo_children():
+            child.destroy()
+        self.top_dropdown_shell.pack_forget()
+        self.active_top_dropdown = None
+
+    def _show_panel_dropdown(self):
+        container = self._prepare_top_dropdown("modules")
+        for idx, (key, label) in enumerate(self.panel_menu_labels.items()):
+            var = self.panel_visibility_vars[key]
+            var.set(self.panels[key].visible)
+            check = tk.Checkbutton(
+                container,
+                text=label,
+                variable=var,
+                command=lambda k=key: self.toggle_panel(k),
+                bg=CARD_BG_ALT,
+                fg=TEXT_MAIN,
+                activebackground=CARD_BG_ALT,
+                activeforeground=TEXT_MAIN,
+                selectcolor=CARD_BG_ALT,
+                font=("Arial", 9, "bold"),
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                padx=8,
+                pady=4,
+                anchor="w",
+            )
+            check.grid(row=idx // 4, column=idx % 4, sticky="w", padx=4, pady=2)
+
+    def _show_layout_dropdown(self):
+        container = self._prepare_top_dropdown("presets")
+        for idx, (label, preset) in enumerate(self.layout_presets):
+            button = tk.Button(
+                container,
+                text=label,
+                command=lambda p=preset: self._select_layout_preset(p),
+                bg=CARD_BG_ALT,
+                fg=TEXT_MAIN,
+                activebackground=CARD_BORDER_SOFT,
+                activeforeground=TEXT_MAIN,
+                font=("Arial", 9, "bold"),
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                padx=10,
+                pady=5,
+            )
+            button.grid(row=0, column=idx, sticky="ew", padx=3, pady=2)
+
+    def _select_layout_preset(self, preset):
+        self._hide_top_dropdown()
+        if preset is None:
+            self.apply_auto_layout_preset()
+        else:
+            self.apply_layout_preset(preset)
 
     def bind_panel_drag(self, panel, widget):
         widget.bind("<ButtonPress-1>", lambda event, p=panel: self.start_panel_drag(p))
@@ -1727,9 +1914,16 @@ class GSNDashboard(tk.Tk):
                     self.state_obj.latest_uav_ip = addr[0]
                 if payload.get("packet_type") == "live_csi":
                     live_csi = np.asarray(payload.get("uav_live_csi"), dtype=np.float32)
+                    live_cnn_csi = payload.get("uav_live_cnn_csi")
+                    if live_cnn_csi is not None:
+                        live_cnn_csi = np.asarray(live_cnn_csi, dtype=np.float32)
                     with self.state_obj.lock:
                         self.state_obj.latest_uav_live_serial = payload.get("serial")
                         self.state_obj.latest_uav_live_csi = live_csi.copy()
+                        self.state_obj.latest_uav_live_cnn_csi = (
+                            None if live_cnn_csi is None else live_cnn_csi.copy()
+                        )
+                        self.state_obj.latest_uav_live_cnn_serial_pair = payload.get("cnn_serial_pair")
                         self.state_obj.latest_uav_live_epoch = payload.get("epoch")
                         self.state_obj.latest_uav_live_csi_time = payload.get("time", time.time())
                     continue
@@ -1775,6 +1969,8 @@ class GSNDashboard(tk.Tk):
         self.state_obj.latest_demo_telemetry_time = None
         self.state_obj.latest_uav_live_serial = None
         self.state_obj.latest_uav_live_csi = None
+        self.state_obj.latest_uav_live_cnn_csi = None
+        self.state_obj.latest_uav_live_cnn_serial_pair = None
         self.state_obj.latest_uav_live_epoch = None
         self.state_obj.latest_uav_live_csi_time = None
         self.state_obj.latest_gsn_live_serial = None
@@ -1920,6 +2116,12 @@ class GSNDashboard(tk.Tk):
                 gsn_live_csi = None if self.state_obj.latest_gsn_live_csi is None else self.state_obj.latest_gsn_live_csi.copy()
                 uav_live_serial = self.state_obj.latest_uav_live_serial
                 uav_live_csi = None if self.state_obj.latest_uav_live_csi is None else self.state_obj.latest_uav_live_csi.copy()
+                uav_live_cnn_csi = (
+                    None
+                    if self.state_obj.latest_uav_live_cnn_csi is None
+                    else self.state_obj.latest_uav_live_cnn_csi.copy()
+                )
+                uav_live_cnn_serial_pair = self.state_obj.latest_uav_live_cnn_serial_pair
                 uav_live_epoch = self.state_obj.latest_uav_live_epoch
                 epoch = self.state_obj.last_epoch
                 latency = self.state_obj.latest_latency_ms
@@ -1977,6 +2179,8 @@ class GSNDashboard(tk.Tk):
                 "gsn_live_csi": gsn_live_csi,
                 "uav_live_serial": uav_live_serial,
                 "uav_live_csi": uav_live_csi,
+                "uav_live_cnn_csi": uav_live_cnn_csi,
+                "uav_live_cnn_serial_pair": uav_live_cnn_serial_pair,
                 "uav_live_epoch": uav_live_epoch,
                 "epoch": epoch,
                 "latency": latency,

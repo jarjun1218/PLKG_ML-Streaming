@@ -55,11 +55,16 @@ def make_demo_packet(
     return json.dumps(packet, separators=(",", ":")).encode("utf-8")
 
 
-def make_live_csi_packet(serial, csi, epoch=None):
+def make_live_csi_packet(serial, csi, epoch=None, cnn_csi=None, cnn_serial_pair=None):
+    if cnn_serial_pair is not None:
+        cnn_serial_pair = [int(item) for item in cnn_serial_pair]
+
     packet = {
         "type": LIVE_CSI_TELEMETRY_TYPE,
         "serial": int(serial),
         "uav_live_csi": _as_float_list(csi),
+        "uav_live_cnn_csi": _as_float_list(cnn_csi),
+        "cnn_serial_pair": cnn_serial_pair,
         "epoch": None if epoch is None else int(epoch),
     }
     return json.dumps(packet, separators=(",", ":")).encode("utf-8")
@@ -123,6 +128,10 @@ def parse_live_csi_packet(data):
     try:
         serial = int(payload["serial"])
         uav_live_csi = _as_float_list(payload.get("uav_live_csi"))
+        uav_live_cnn_csi = _as_float_list(payload.get("uav_live_cnn_csi"))
+        cnn_serial_pair = payload.get("cnn_serial_pair")
+        if cnn_serial_pair is not None:
+            cnn_serial_pair = tuple(int(item) for item in cnn_serial_pair)
         epoch = payload.get("epoch")
         if epoch is not None:
             epoch = int(epoch)
@@ -137,6 +146,8 @@ def parse_live_csi_packet(data):
         "serial": serial,
         "epoch": epoch,
         "uav_live_csi": uav_live_csi,
+        "uav_live_cnn_csi": uav_live_cnn_csi,
+        "cnn_serial_pair": cnn_serial_pair,
         "time": time.time(),
     }
 
@@ -258,7 +269,7 @@ class LiveCSITelemetrySender:
         send_interval=0.05,
     ):
         """
-        get_csi_state() -> (serial, csi, epoch)
+        get_csi_state() -> (serial, csi, epoch[, cnn_csi, cnn_serial_pair])
         Sends the latest UAV CSI for visualization only. This is intentionally
         independent from the key epoch/helper sender.
         """
@@ -280,7 +291,9 @@ class LiveCSITelemetrySender:
                 time.sleep(0.02)
                 continue
 
-            serial, csi, epoch = state
+            serial, csi, epoch = state[:3]
+            cnn_csi = state[3] if len(state) > 3 else None
+            cnn_serial_pair = state[4] if len(state) > 4 else None
             now = time.time()
             if serial is None or csi is None:
                 time.sleep(0.02)
@@ -290,7 +303,13 @@ class LiveCSITelemetrySender:
                 time.sleep(0.005)
                 continue
 
-            msg = make_live_csi_packet(serial, csi, epoch=epoch)
+            msg = make_live_csi_packet(
+                serial,
+                csi,
+                epoch=epoch,
+                cnn_csi=cnn_csi,
+                cnn_serial_pair=cnn_serial_pair,
+            )
             sock.sendto(msg, (self.gsn_ip, self.port))
 
             if self.debug and now - last_log_time >= 1.0:
