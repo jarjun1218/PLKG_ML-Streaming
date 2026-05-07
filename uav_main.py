@@ -70,7 +70,7 @@ CSI_PAIR_WAIT_RESET_COOLDOWN_SEC = 20.0
 DEMO_TELEMETRY_ENABLED = DemoTelemetrySender is not None
 KEY_SOURCE = os.environ.get("PLKG_KEY_SOURCE", "cnnq").strip().lower()
 
-MODEL_CSI_PATH = "model_reserved/cnn_basic/model_final.pth"
+MODEL_CSI_PATH = "model_reserved/cnn_basic/model_final_test.pth"
 MODEL_KEY_QUAN_PATH = "model_reserved/cnn_basic_quan/model_final.pth"
 
 
