@@ -44,13 +44,15 @@ except ImportError as exc:
 # ======================================================
 # Config
 # ======================================================
+# GSN_IP = os.environ.get("GSN_IP", "192.168.0.104")
 GSN_IP = os.environ.get("GSN_IP", "192.168.0.149")
+# GSN_IP = os.environ.get("GSN_IP", "102.168.0.154")
 CSI_PORT = "/dev/ttyUSB0"
 CSI_BAUD = 115200
 DEBUG = False
 PREVIEW = False
 VIDEO_RESOLUTION = (1280, 720)
-VIDEO_FPS = 15
+VIDEO_FPS = 30
 VIDEO_H264_BITRATE = 8_000_000
 VIDEO_H264_IPERIOD = 15
 VIDEO_JPEG_QUALITY = 10
