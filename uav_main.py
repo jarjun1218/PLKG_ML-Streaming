@@ -49,7 +49,7 @@ CSI_PORT = "/dev/ttyUSB0"
 CSI_BAUD = 115200
 DEBUG = False
 PREVIEW = False
-VIDEO_RESOLUTION = (960, 540)
+VIDEO_RESOLUTION = (1280, 720)
 VIDEO_FPS = 15
 VIDEO_H264_BITRATE = 8_000_000
 VIDEO_H264_IPERIOD = 15
@@ -70,7 +70,7 @@ CSI_PAIR_WAIT_RESET_COOLDOWN_SEC = 20.0
 DEMO_TELEMETRY_ENABLED = DemoTelemetrySender is not None
 KEY_SOURCE = os.environ.get("PLKG_KEY_SOURCE", "cnnq").strip().lower()
 
-MODEL_CSI_PATH = "model_reserved/cnn_basic/model_final_test.pth"
+MODEL_CSI_PATH = "model_reserved/cnn_basic/model_final.pth"
 MODEL_KEY_QUAN_PATH = "model_reserved/cnn_basic_quan/model_final.pth"
 
 
@@ -87,6 +87,7 @@ class KeyState:
         self.helper = None         # BCH syndrome helper (base64)
         self.confirm = None        # HMAC confirmation tag (hex)
         self.aes_key = None        # AES key (bytes)
+        self.rssi = None           # UAV RSSI
         self.raw_csi = None        # first preprocessed UAV CSI
         self.raw_csi_2 = None      # second preprocessed UAV CSI
         self.raw_key = None        # direct quantization from first raw CSI
@@ -95,12 +96,15 @@ class KeyState:
         self.cnn_key = None        # quantization from CNN-corrected CSI
         self.cnnq_key = None       # CNN-Q correction from direct raw key
         self.corrected_key = None  # active key selected for BCH/AES
+        self.live_cnn_csi = None
+        self.live_cnn_serial_pair = None
 
     def update(
         self,
         serial_pair,
         helper,
         aes_key,
+        rssi=None,
         raw_csi=None,
         raw_csi_2=None,
         raw_key=None,
@@ -124,6 +128,7 @@ class KeyState:
             self.helper = helper
             self.confirm = make_key_confirm(aes_key, self.epoch, serial_token, helper)
             self.aes_key = aes_key
+            self.rssi = [rssi] if rssi is not None and not isinstance(rssi, (list, tuple)) else rssi
             self.raw_csi = None if raw_csi is None else np.asarray(raw_csi, dtype=np.float32).copy()
             self.raw_csi_2 = None if raw_csi_2 is None else np.asarray(raw_csi_2, dtype=np.float32).copy()
             self.raw_key = raw_key
@@ -132,6 +137,8 @@ class KeyState:
             self.cnn_key = cnn_key
             self.cnnq_key = cnnq_key
             self.corrected_key = corrected_key
+            self.live_cnn_csi = None if cnn_csi is None else np.asarray(cnn_csi, dtype=np.float32).copy()
+            self.live_cnn_serial_pair = pair
 
     def invalidate(self):
         with self.lock:
@@ -142,6 +149,7 @@ class KeyState:
             self.helper = None
             self.confirm = None
             self.aes_key = None
+            self.rssi = None
             self.raw_csi = None
             self.raw_csi_2 = None
             self.raw_key = None
@@ -150,6 +158,8 @@ class KeyState:
             self.cnn_key = None
             self.cnnq_key = None
             self.corrected_key = None
+            self.live_cnn_csi = None
+            self.live_cnn_serial_pair = None
 
     def for_reconciliation(self):
         with self.lock:
@@ -165,9 +175,19 @@ class KeyState:
 
     def current_cnn_csi(self):
         with self.lock:
-            cnn_csi = None if self.cnn_csi is None else self.cnn_csi.copy()
-            serial_pair = None if self.serial_pair is None else tuple(self.serial_pair)
+            source_csi = self.live_cnn_csi if self.live_cnn_csi is not None else self.cnn_csi
+            source_pair = self.live_cnn_serial_pair if self.live_cnn_serial_pair is not None else self.serial_pair
+            cnn_csi = None if source_csi is None else source_csi.copy()
+            serial_pair = None if source_pair is None else tuple(source_pair)
             return cnn_csi, serial_pair
+
+    def update_live_cnn_csi(self, serial_pair, cnn_csi):
+        if cnn_csi is None:
+            return
+        pair = tuple(int(item) for item in serial_pair)
+        with self.lock:
+            self.live_cnn_csi = np.asarray(cnn_csi, dtype=np.float32).copy()
+            self.live_cnn_serial_pair = pair
 
     def for_demo_telemetry(self):
         with self.lock:
@@ -177,6 +197,7 @@ class KeyState:
             return (
                 self.epoch,
                 self.serial,
+                self.rssi,
                 raw_csi,
                 self.raw_key,
                 self.corrected_key,
@@ -291,6 +312,7 @@ class CSISerialWatcher:
         return {
             "serial": sample["serial"],
             "csi": sample["csi"],
+            "rssi": sample["rssi"],
         }
 
 
@@ -478,11 +500,6 @@ def keygen_thread():
             continue
         consecutive_pair_wait_logs = 0
 
-        now = time.monotonic()
-        if now < next_keygen_time:
-            time.sleep(0.01)
-            continue
-
         serial_1, serial_2 = pair
         s1 = samples[serial_1]
         s2 = samples[serial_2]
@@ -502,12 +519,18 @@ def keygen_thread():
             try:
                 # === Step 2: CSI -> CNN -> corrected CSI -> CNN key diagnostic ===
                 cnn_csi = reconstruct_csi_cnn(model_csi, csi_1, csi_2)
+                key_state.update_live_cnn_csi((serial_1, serial_2), cnn_csi)
                 bits = quantization_1(cnn_csi, Nbits=2, inbits=13, guard=0)
                 cnn_key = force_102_bits("".join(str(b) for b in bits))
             except Exception as exc:
                 print(f"[UAV] CNN diagnostic failed for serial_pair={serial_1},{serial_2}: {exc}")
                 cnn_csi = None
                 cnn_key = None
+
+        now = time.monotonic()
+        if now < next_keygen_time:
+            time.sleep(0.01)
+            continue
 
         if model_q is not None:
             try:
@@ -538,9 +561,10 @@ def keygen_thread():
 
         # === Step 6: key confirmation tag ===
         key_state.update(
-            serial_1,
+            (serial_1, serial_2),
             helper,
             aes_key,
+            rssi=s1.get("rssi"),
             raw_csi=csi_1,
             raw_csi_2=csi_2,
             raw_key=direct_key,

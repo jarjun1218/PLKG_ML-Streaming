@@ -23,6 +23,7 @@ def _as_float_list(values, precision=6):
 def make_demo_packet(
     epoch,
     serial,
+    uav_rssi,
     raw_csi,
     raw_key,
     corrected_key,
@@ -45,6 +46,7 @@ def make_demo_packet(
         "serial_pair": serial_pair,
         "uav_raw_csi": _as_float_list(raw_csi),
         "uav_raw_csi_2": _as_float_list(raw_csi_2),
+        "uav_rssi": _as_float_list(uav_rssi),
         "uav_raw_key": str(raw_key),
         "uav_raw_key_2": None if raw_key_2 is None else str(raw_key_2),
         "uav_cnn_csi": _as_float_list(cnn_csi),
@@ -88,6 +90,7 @@ def parse_demo_packet(data):
         serial_pair = tuple(int(item) for item in serial_pair)
         uav_raw_csi = _as_float_list(payload.get("uav_raw_csi"))
         uav_raw_csi_2 = _as_float_list(payload.get("uav_raw_csi_2"))
+        uav_rssi = _as_float_list(payload.get("uav_rssi"))
         uav_raw_key = str(payload["uav_raw_key"])
         uav_raw_key_2 = payload.get("uav_raw_key_2")
         uav_corrected_key = str(payload["uav_corrected_key"])
@@ -106,6 +109,7 @@ def parse_demo_packet(data):
         "serial_pair": serial_pair,
         "uav_raw_csi": uav_raw_csi,
         "uav_raw_csi_2": uav_raw_csi_2,
+        "uav_rssi": uav_rssi,
         "uav_raw_key": uav_raw_key,
         "uav_raw_key_2": None if uav_raw_key_2 is None else str(uav_raw_key_2),
         "uav_cnn_csi": uav_cnn_csi,
@@ -177,6 +181,7 @@ class DemoTelemetrySender:
         get_demo_state() -> (
             epoch,
             csi_serial,
+            uav_rssi,
             raw_csi,
             raw_key,
             corrected_key,
@@ -202,13 +207,13 @@ class DemoTelemetrySender:
 
         while True:
             state = self.get_demo_state()
-            epoch, serial, raw_csi, raw_key, corrected_key = state[:5]
-            cnn_csi = state[5] if len(state) > 5 else None
-            cnn_key = state[6] if len(state) > 6 else None
-            cnnq_key = state[7] if len(state) > 7 else None
-            serial_pair = state[8] if len(state) > 8 else None
-            raw_csi_2 = state[9] if len(state) > 9 else None
-            raw_key_2 = state[10] if len(state) > 10 else None
+            epoch, serial, rssi, raw_csi, raw_key, corrected_key = state[:6]
+            cnn_csi = state[6] if len(state) > 6 else None
+            cnn_key = state[7] if len(state) > 7 else None
+            cnnq_key = state[8] if len(state) > 8 else None
+            serial_pair = state[9] if len(state) > 9 else None
+            raw_csi_2 = state[10] if len(state) > 10 else None
+            raw_key_2 = state[11] if len(state) > 11 else None
             now = time.time()
             if (
                 epoch < 0
@@ -236,6 +241,7 @@ class DemoTelemetrySender:
             msg = make_demo_packet(
                 epoch,
                 serial,
+                rssi,
                 raw_csi,
                 raw_key,
                 corrected_key,

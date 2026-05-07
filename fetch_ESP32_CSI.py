@@ -214,7 +214,7 @@ class CSIReader:
 
     def stop_plot(self):
         if self.ani:
-            plt.close(self.fig)
+            # plt.close(self.fig)
             print("Plot closed.")
         else:
             print("No plot to close.")

@@ -678,6 +678,7 @@ class TextModulePanel(ModulePanel):
                     "Waiting for matching GSN serial and confirmed BCH epoch...",
                     "",
                     f"epoch/serials    : {uav_demo.get('epoch', '--')}/{pair_label}",
+                    f"UAV RSSI         : {uav_demo.get('uav_rssi', ['--'])[0]}",
                     f"UAV raw key      : {short_bits(uav_demo.get('uav_raw_key'))}",
                     f"UAV raw key 2    : {short_bits(uav_demo.get('uav_raw_key_2'))}",
                     f"UAV CNN key      : {short_bits(uav_demo.get('uav_cnn_key'))}",
@@ -695,6 +696,7 @@ class TextModulePanel(ModulePanel):
                 pair_label = serial_pair_label(demo.get("serial_pair", (demo.get("serial", "--"),)))
                 lines = [
                     f"epoch/serials    : {demo.get('epoch', '--')}/{pair_label}",
+                    f"UAV RSSI         : {demo.get('uav_rssi', ['--'])[0]}",
                     f"raw KDR          : {fmt_pct(demo.get('raw_kdr'))}",
                     f"active target KDR: {fmt_pct(demo.get('active_target_kdr'))}",
                     f"corrected KDR    : {fmt_pct(demo.get('corrected_kdr'))}",
@@ -2009,6 +2011,7 @@ class GSNDashboard(tk.Tk):
             "epoch": epoch,
             "serial": serial,
             "serial_pair": serial_pair,
+            "uav_rssi": uav_demo.get("uav_rssi"),
             "uav_raw_csi": list(uav_demo["uav_raw_csi"]),
             "uav_raw_csi_2": uav_demo.get("uav_raw_csi_2"),
             "uav_cnn_csi": uav_demo.get("uav_cnn_csi"),

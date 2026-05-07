@@ -224,24 +224,25 @@ class UAVVideoStreamer:
             send_ms = (send_time_s * 1000.0 / frames_sent) if frames_sent else 0.0
             queue_ms = (pre_send_queue_time_s * 1000.0 / frames_sent) if frames_sent else 0.0
 
-            print(
-                "[UAV Stats] "
-                f"fps_in={fps_in:.1f} "
-                f"fps_out={frames_sent / elapsed:.1f} "
-                f"pkts/s={packets_sent / elapsed:.1f} "
-                f"mbps={mbps:.2f} "
-                f"avg_payload_kb={avg_payload_kb:.1f} "
-                f"avg_chunks={avg_chunks:.1f} "
-                f"cap_ms={capture_ms:.1f} "
-                f"swenc_ms={software_encode_ms:.1f} "
-                f"enc_ms={encrypt_ms:.1f} "
-                f"send_ms={send_ms:.1f} "
-                f"queue_ms={queue_ms:.1f} "
-                f"qdrop/s={queue_drops / elapsed:.1f} "
-                f"encskip/s={encoder_skips / elapsed:.1f} "
-                f"keywait/s={key_wait_frames / elapsed:.1f} "
-                f"clock_ms={clock_offset_ms:.1f}"
-            )
+            if self.debug:
+                print(
+                    "[UAV Stats] "
+                    f"fps_in={fps_in:.1f} "
+                    f"fps_out={frames_sent / elapsed:.1f} "
+                    f"pkts/s={packets_sent / elapsed:.1f} "
+                    f"mbps={mbps:.2f} "
+                    f"avg_payload_kb={avg_payload_kb:.1f} "
+                    f"avg_chunks={avg_chunks:.1f} "
+                    f"cap_ms={capture_ms:.1f} "
+                    f"swenc_ms={software_encode_ms:.1f} "
+                    f"enc_ms={encrypt_ms:.1f} "
+                    f"send_ms={send_ms:.1f} "
+                    f"queue_ms={queue_ms:.1f} "
+                    f"qdrop/s={queue_drops / elapsed:.1f} "
+                    f"encskip/s={encoder_skips / elapsed:.1f} "
+                    f"keywait/s={key_wait_frames / elapsed:.1f} "
+                    f"clock_ms={clock_offset_ms:.1f}"
+                )
 
     def _get_clock_offset(self):
         with self.clock_offset_lock:
