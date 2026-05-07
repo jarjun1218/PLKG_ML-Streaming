@@ -11,6 +11,8 @@ LIVE_CSI_TELEMETRY_TYPE = "LIVE_CSI_SNAPSHOT"
 def _as_float_list(values, precision=6):
     if values is None:
         return None
+    if isinstance(values, (float, int)):
+        values = [values]
     out = []
     for value in values:
         try:
