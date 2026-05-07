@@ -56,12 +56,15 @@ class GSNReceiver:
         sync_port=5006,
         decode_queue_size=32,
         on_eve_frame=None,
+        get_eve_aes_key=None,
     ):
         """
         get_aes_key(epoch) -> bytes
+        get_eve_aes_key(epoch) -> bytes, optional attacker-side key guess
         on_frame(frame_bgr, latency_ms)
         """
         self.get_aes_key = get_aes_key
+        self.get_eve_aes_key = get_eve_aes_key or (lambda _epoch: None)
         self.on_frame = on_frame
         self.on_eve_frame = on_eve_frame
         self.video_port = video_port
@@ -232,13 +235,23 @@ class GSNReceiver:
             h, w = 360, 640
         return np.random.randint(0, 256, (max(1, h), max(1, w), 3), dtype=np.uint8)
 
-    def _emit_eve_frame(self, frame, encrypted):
+    def _emit_eve_frame(self, frame, encrypted, decrypted=False):
         if self.on_eve_frame is None:
             return
         try:
-            self.on_eve_frame(frame, encrypted)
+            self.on_eve_frame(frame, encrypted, decrypted)
         except Exception as exc:
             print(f"[GSNReceiver] EVE frame callback error: {exc}")
+
+    @staticmethod
+    def _try_decrypt_payload(key, blob):
+        if key is None:
+            return None
+        try:
+            nonce, cipher = blob[:12], blob[12:]
+            return AESGCM(key).decrypt(nonce, cipher, None)
+        except Exception:
+            return None
 
     def _show(self):
         last_epoch = None
@@ -250,7 +263,7 @@ class GSNReceiver:
             if encrypted:
                 key = self.get_aes_key(epoch)
                 if key is None:
-                    self._emit_eve_frame(self._noise_frame(), True)
+                    self._emit_eve_frame(self._noise_frame(), True, False)
                     continue
 
                 if epoch != last_epoch or aes_cipher is None:
@@ -262,10 +275,14 @@ class GSNReceiver:
                 try:
                     payload = aes_cipher.decrypt(nonce, cipher, None)
                 except Exception:
-                    self._emit_eve_frame(self._noise_frame(), True)
+                    self._emit_eve_frame(self._noise_frame(), True, False)
                     continue
+
+                eve_payload = self._try_decrypt_payload(self.get_eve_aes_key(epoch), blob)
+                eve_decrypted = eve_payload is not None
             else:
                 payload = blob
+                eve_decrypted = True
                 aes_cipher = None
                 last_epoch = None
 
@@ -274,9 +291,12 @@ class GSNReceiver:
                 continue
 
             if encrypted:
-                self._emit_eve_frame(self._noise_frame(frame), True)
+                if eve_decrypted:
+                    self._emit_eve_frame(frame.copy(), True, True)
+                else:
+                    self._emit_eve_frame(self._noise_frame(frame), True, False)
             else:
-                self._emit_eve_frame(frame.copy(), False)
+                self._emit_eve_frame(frame.copy(), False, True)
 
             # Guard against transient future timestamps while clock sync is warming up.
             latency = max(0.0, (time.time() - ts) * 1000)

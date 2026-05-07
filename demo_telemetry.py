@@ -57,7 +57,7 @@ def make_demo_packet(
     return json.dumps(packet, separators=(",", ":")).encode("utf-8")
 
 
-def make_live_csi_packet(serial, csi, epoch=None, cnn_csi=None, cnn_serial_pair=None):
+def make_live_csi_packet(serial, csi, epoch=None, cnn_csi=None, cnn_serial_pair=None, uav_rssi=None):
     if cnn_serial_pair is not None:
         cnn_serial_pair = [int(item) for item in cnn_serial_pair]
 
@@ -68,6 +68,7 @@ def make_live_csi_packet(serial, csi, epoch=None, cnn_csi=None, cnn_serial_pair=
         "uav_live_cnn_csi": _as_float_list(cnn_csi),
         "cnn_serial_pair": cnn_serial_pair,
         "epoch": None if epoch is None else int(epoch),
+        "uav_rssi": _as_float_list(uav_rssi) if uav_rssi is not None else None,
     }
     return json.dumps(packet, separators=(",", ":")).encode("utf-8")
 
@@ -134,6 +135,7 @@ def parse_live_csi_packet(data):
         uav_live_csi = _as_float_list(payload.get("uav_live_csi"))
         uav_live_cnn_csi = _as_float_list(payload.get("uav_live_cnn_csi"))
         cnn_serial_pair = payload.get("cnn_serial_pair")
+        uav_rssi = _as_float_list(payload.get("uav_rssi"))
         if cnn_serial_pair is not None:
             cnn_serial_pair = tuple(int(item) for item in cnn_serial_pair)
         epoch = payload.get("epoch")
@@ -152,6 +154,7 @@ def parse_live_csi_packet(data):
         "uav_live_csi": uav_live_csi,
         "uav_live_cnn_csi": uav_live_cnn_csi,
         "cnn_serial_pair": cnn_serial_pair,
+        "uav_rssi": uav_rssi,
         "time": time.time(),
     }
 
@@ -300,6 +303,7 @@ class LiveCSITelemetrySender:
             serial, csi, epoch = state[:3]
             cnn_csi = state[3] if len(state) > 3 else None
             cnn_serial_pair = state[4] if len(state) > 4 else None
+            uav_rssi = state[5] if len(state) > 5 else None
             now = time.time()
             if serial is None or csi is None:
                 time.sleep(0.02)
@@ -315,6 +319,7 @@ class LiveCSITelemetrySender:
                 epoch=epoch,
                 cnn_csi=cnn_csi,
                 cnn_serial_pair=cnn_serial_pair,
+                uav_rssi=uav_rssi,
             )
             sock.sendto(msg, (self.gsn_ip, self.port))
 

@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 
 import cv2
@@ -61,6 +62,67 @@ ACCENT_AMBER = "#ffbf5a"
 ACCENT_PINK = "#f472b6"
 ACCENT_GREEN = "#4ade80"
 ACCENT_VIOLET = "#9b8cff"
+
+GUI_FONT_SCALE_MIN = 0.5
+GUI_FONT_SCALE_MAX = 2.0
+
+
+def _clamp_gui_font_scale(value):
+    return max(GUI_FONT_SCALE_MIN, min(GUI_FONT_SCALE_MAX, float(value)))
+
+
+def _read_gui_font_scale():
+    try:
+        return _clamp_gui_font_scale(os.environ.get("GSN_GUI_FONT_SCALE", "1.35"))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+GUI_FONT_SCALE = _read_gui_font_scale()
+
+
+def ui_font_size(size):
+    return max(6, int(round(size * GUI_FONT_SCALE)))
+
+
+def ui_font(family, size, *styles):
+    return (family, ui_font_size(size), *styles)
+
+
+def ui_px(size):
+    return max(1, int(round(size * GUI_FONT_SCALE)))
+
+
+def ui_cv_font_scale(scale):
+    return max(0.1, float(scale) * GUI_FONT_SCALE)
+
+
+def ui_cv_thickness(thickness):
+    return max(1, int(round(thickness * GUI_FONT_SCALE)))
+
+
+def ui_cv_fit_font_scale(text, scale, max_width, thickness=1):
+    font_scale = ui_cv_font_scale(scale)
+    max_width = int(max_width)
+    if max_width <= 0:
+        return font_scale
+    thickness = max(1, int(round(thickness)))
+    text_width = cv2.getTextSize(
+        str(text),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        thickness,
+    )[0][0]
+    if text_width > max_width:
+        font_scale *= max_width / max(text_width, 1)
+    return max(0.1, font_scale)
+
+
+def set_gui_font_scale(value):
+    global GUI_FONT_SCALE
+    old_scale = GUI_FONT_SCALE
+    GUI_FONT_SCALE = _clamp_gui_font_scale(value)
+    return old_scale, GUI_FONT_SCALE
 
 
 def short_bits(bits, limit=64):
@@ -135,6 +197,12 @@ class GSNState:
     latest_eve_csi: np.ndarray | None = None
     latest_eve_mac: str | None = None
     latest_eve_csi_time: float | None = None
+    latest_eve_raw: str | None = None
+    latest_eve_aes_key: bytes | None = None
+    latest_eve_key_status: str = "Waiting for EVE CSI."
+    eve_raw_by_serial: dict = field(default_factory=dict)
+    eve_aes_by_serial: dict = field(default_factory=dict)
+    eve_keys_by_epoch: dict = field(default_factory=dict)
     pending_uav_csi_reset: bool = True
 
     last_epoch: int | None = None
@@ -160,6 +228,7 @@ class GSNState:
     latest_eve_video_bgr: np.ndarray | None = None
     latest_eve_video_time: float | None = None
     latest_eve_video_encrypted: bool | None = None
+    latest_eve_video_decrypted: bool | None = None
     video_encryption_enabled: bool = True
     latest_uav_ip: str | None = None
     video_status: str = "Waiting for frames..."
@@ -168,16 +237,18 @@ class GSNState:
     latest_kdr_raw: float | None = None
     latest_kdr_corr: float | None = None
     latest_demo_raw_kdr: float | None = None
-    latest_demo_target_kdr: float | None = None
-    latest_demo_corr_kdr: float | None = None
+    latest_demo_cnn_kdr: float | None = None
+    latest_demo_cnnq_kdr: float | None = None
     kdr_raw_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     kdr_corr_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     demo_raw_kdr_hist: deque = field(default_factory=lambda: deque(maxlen=100))
-    demo_corr_kdr_hist: deque = field(default_factory=lambda: deque(maxlen=100))
+    demo_cnn_kdr_hist: deque = field(default_factory=lambda: deque(maxlen=100))
+    demo_cnnq_kdr_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     demo_hist_epochs: set = field(default_factory=set)
     latency_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     latency_ema_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     rssi_hist: deque = field(default_factory=lambda: deque(maxlen=100))
+    uav_rssi_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     noise_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     eve_rssi_hist: deque = field(default_factory=lambda: deque(maxlen=100))
     eve_noise_hist: deque = field(default_factory=lambda: deque(maxlen=100))
@@ -197,7 +268,7 @@ class PanelHost(tk.Frame):
             text=self.placeholder_text,
             bg=CARD_BG_ALT,
             fg=TEXT_MUTED,
-            font=("Arial", 10, "italic"),
+            font=ui_font("Arial", 10, "italic"),
             highlightthickness=1,
             highlightbackground=CARD_BORDER_SOFT,
         )
@@ -254,9 +325,9 @@ class BasePanel:
         titlebar = tk.Frame(self.card, bg=TITLE_BG, height=30)
         titlebar.pack(fill="x")
         titlebar.pack_propagate(False)
-        grip = tk.Label(titlebar, text="::", bg=TITLE_BG, fg=TEXT_SOFT, font=("Consolas", 11, "bold"))
+        grip = tk.Label(titlebar, text="::", bg=TITLE_BG, fg=TEXT_SOFT, font=ui_font("Consolas", 11, "bold"))
         grip.pack(side="left", padx=(8, 4))
-        label = tk.Label(titlebar, text=self.title, bg=TITLE_BG, fg=TEXT_MAIN, font=("Arial", 11, "bold"))
+        label = tk.Label(titlebar, text=self.title, bg=TITLE_BG, fg=TEXT_MAIN, font=ui_font("Arial", 11, "bold"))
         label.pack(side="left", padx=(0, 8))
         self.body = tk.Frame(self.card, bg=CARD_BG)
         self.body.pack(fill="both", expand=True)
@@ -316,9 +387,9 @@ class ModulePanel(BasePanel):
         titlebar.pack_propagate(False)
         accent = tk.Frame(titlebar, bg=ACCENT_BLUE, width=3)
         accent.pack(side="left", fill="y", padx=(0, 8))
-        grip = tk.Label(titlebar, text="::", bg=TITLE_BG, fg=TEXT_SOFT, font=("Consolas", 12, "bold"))
+        grip = tk.Label(titlebar, text="::", bg=TITLE_BG, fg=TEXT_SOFT, font=ui_font("Consolas", 12, "bold"))
         grip.pack(side="left", padx=(0, 7))
-        label = tk.Label(titlebar, text=self.title, bg=TITLE_BG, fg=TEXT_MAIN, font=("Arial", 11, "bold"))
+        label = tk.Label(titlebar, text=self.title, bg=TITLE_BG, fg=TEXT_MAIN, font=ui_font("Arial", 11, "bold"))
         label.pack(side="left", fill="x", expand=True, padx=(0, 8))
         if len(self.content_options) > 1:
             self.content_var = tk.StringVar(value=self.content_options[self.content_key])
@@ -336,7 +407,7 @@ class ModulePanel(BasePanel):
         else:
             self.content_var = None
             self.selector = None
-            tk.Label(titlebar, text=self.content_options[self.content_key], bg=TITLE_BG, fg=TEXT_MUTED, font=("Arial", 9, "bold")).pack(side="right", padx=10)
+            tk.Label(titlebar, text=self.content_options[self.content_key], bg=TITLE_BG, fg=TEXT_MUTED, font=ui_font("Arial", 9, "bold")).pack(side="right", padx=10)
 
         self.body = tk.Frame(self.card, bg=CARD_BG)
         self.body.pack(fill="both", expand=True)
@@ -362,7 +433,7 @@ class ModulePanel(BasePanel):
 
 
 class VideoModulePanel(ModulePanel):
-    def __init__(self, dashboard, key="media_main", title="Decrypted Video", default_content="video"):
+    def __init__(self, dashboard, key="media_main", title="Video Stream", default_content="video"):
         super().__init__(
             dashboard,
             key,
@@ -385,7 +456,13 @@ class VideoModulePanel(ModulePanel):
         )
         self.viewport.place(relx=0.5, rely=0.5, anchor="center")
         self.viewport.pack_propagate(False)
-        self.video_label = tk.Label(self.viewport, text="Waiting for frames...", bg="#020617", fg="#cbd5e1")
+        self.video_label = tk.Label(
+            self.viewport,
+            text="Waiting for frames...",
+            bg="#020617",
+            fg="#cbd5e1",
+            font=ui_font("Arial", 12, "bold"),
+        )
         self.video_label.place(relx=0.5, rely=0.5, anchor="center")
         self.video_hint = ttk.Label(parent, text="Waiting for UAV video stream.", style="StatusIdle.TLabel")
         self.video_hint.pack(anchor="w", padx=10, pady=(8, 10))
@@ -424,14 +501,15 @@ class VideoModulePanel(ModulePanel):
     def _placeholder_pip(width, height, text):
         pip = np.zeros((max(1, height), max(1, width), 3), dtype=np.uint8)
         pip[:] = (24, 31, 45)
+        thickness = ui_cv_thickness(1)
         cv2.putText(
             pip,
             text,
-            (10, max(28, height // 2)),
+            (ui_px(10), max(ui_px(28), height // 2)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            ui_cv_fit_font_scale(text, 0.55, width - ui_px(20), thickness),
             (203, 213, 225),
-            1,
+            thickness,
             cv2.LINE_AA,
         )
         return pip
@@ -444,11 +522,12 @@ class VideoModulePanel(ModulePanel):
 
         eve_frame = self.snapshot.get("eve_video_frame")
         encrypted = self.snapshot.get("eve_video_encrypted")
+        eve_decrypted = self.snapshot.get("eve_video_decrypted")
         encryption_enabled = bool(self.snapshot.get("video_encryption_enabled", True))
         eve_time = self.snapshot.get("eve_video_time")
         eve_is_fresh = eve_time is not None and time.time() - eve_time <= 1.5
 
-        pip_w = int(w * 0.28)
+        pip_w = int(w * 0.45)
         pip_w = max(180, min(pip_w, 340, int(w * 0.42)))
         pip_h = int(pip_w / VIDEO_VIEWPORT_ASPECT)
         pip_h = max(105, min(pip_h, int(h * 0.42)))
@@ -462,20 +541,24 @@ class VideoModulePanel(ModulePanel):
         else:
             pip = cv2.resize(eve_frame, (pip_w, pip_h))
             if encrypted:
-                label = "EVE: noise"
-                color = (80, 180, 255)
+                if eve_decrypted:
+                    label = "EVE (decrypted)"
+                    color = (80, 255, 180)
+                else:
+                    label = "EVE (could not decrypt)"
+                    color = (80, 180, 255)
             else:
-                label = "EVE: video"
+                label = "EVE (no encryption)"
                 color = (80, 255, 180)
 
-        margin = max(12, int(min(w, h) * 0.025))
+        margin = max(ui_px(12), int(min(w, h) * 0.025))
         x1 = max(0, w - pip_w - margin)
         y1 = max(0, h - pip_h - margin)
         x2 = min(w, x1 + pip_w)
         y2 = min(h, y1 + pip_h)
         pip = pip[: y2 - y1, : x2 - x1]
 
-        border = 3
+        border = ui_px(3)
         cv2.rectangle(
             disp,
             (max(0, x1 - border), max(0, y1 - border)),
@@ -485,18 +568,19 @@ class VideoModulePanel(ModulePanel):
         )
         disp[y1:y2, x1:x2] = pip
 
-        label_h = 26
+        label_h = ui_px(26)
         overlay = disp.copy()
         cv2.rectangle(overlay, (x1, y1), (x2, min(y2, y1 + label_h)), (2, 6, 23), -1)
         cv2.addWeighted(overlay, 0.68, disp, 0.32, 0, disp)
+        label_thickness = ui_cv_thickness(1)
         cv2.putText(
             disp,
             label,
-            (x1 + 8, y1 + 19),
+            (x1 + ui_px(8), y1 + ui_px(19)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            ui_cv_fit_font_scale(label, 0.55, (x2 - x1) - ui_px(16), label_thickness),
             color,
-            1,
+            label_thickness,
             cv2.LINE_AA,
         )
 
@@ -530,33 +614,38 @@ class VideoModulePanel(ModulePanel):
     def _draw_stalled_overlay(disp):
         h, w = disp.shape[:2]
         overlay = disp.copy()
-        box_w = min(max(360, int(w * 0.46)), max(1, w - 32))
-        box_h = 82
-        x1 = max(12, (w - box_w) // 2)
-        y1 = max(12, int(h * 0.12))
-        x2 = min(w - 12, x1 + box_w)
-        y2 = min(h - 12, y1 + box_h)
+        edge_pad = ui_px(12)
+        box_w = min(max(ui_px(360), int(w * 0.46)), max(1, w - ui_px(32)))
+        box_h = ui_px(82)
+        x1 = max(edge_pad, (w - box_w) // 2)
+        y1 = max(edge_pad, int(h * 0.12))
+        x2 = min(w - edge_pad, x1 + box_w)
+        y2 = min(h - edge_pad, y1 + box_h)
         cv2.rectangle(overlay, (x1, y1), (x2, y2), (2, 6, 23), -1)
         cv2.addWeighted(overlay, 0.72, disp, 0.28, 0, disp)
-        cv2.rectangle(disp, (x1, y1), (x2, y2), (251, 113, 133), 2)
+        cv2.rectangle(disp, (x1, y1), (x2, y2), (251, 113, 133), ui_cv_thickness(2))
+        title = "Video stalled"
+        title_thickness = ui_cv_thickness(2)
         cv2.putText(
             disp,
-            "Video stalled",
-            (x1 + 18, y1 + 32),
+            title,
+            (x1 + ui_px(18), y1 + ui_px(32)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.82,
+            ui_cv_fit_font_scale(title, 0.82, (x2 - x1) - ui_px(36), title_thickness),
             (251, 113, 133),
-            2,
+            title_thickness,
             cv2.LINE_AA,
         )
+        subtitle = "Waiting for UAV stream recovery"
+        subtitle_thickness = ui_cv_thickness(1)
         cv2.putText(
             disp,
-            "Waiting for UAV stream recovery",
-            (x1 + 18, y1 + 62),
+            subtitle,
+            (x1 + ui_px(18), y1 + ui_px(62)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            ui_cv_fit_font_scale(subtitle, 0.55, (x2 - x1) - ui_px(36), subtitle_thickness),
             (226, 232, 240),
-            1,
+            subtitle_thickness,
             cv2.LINE_AA,
         )
         return disp
@@ -598,7 +687,18 @@ class VideoModulePanel(ModulePanel):
 
         disp = self._compose_with_eve_pip(frame)
         if latency is not None:
-            cv2.putText(disp, f"Latency={latency:.1f} ms", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            latency_text = f"Latency={latency:.1f} ms"
+            latency_thickness = ui_cv_thickness(2)
+            cv2.putText(
+                disp,
+                latency_text,
+                (ui_px(10), ui_px(28)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                ui_cv_fit_font_scale(latency_text, 0.8, disp.shape[1] - ui_px(20), latency_thickness),
+                (0, 255, 0),
+                latency_thickness,
+                cv2.LINE_AA,
+            )
         self._present_bgr_frame(disp, video_status, video_status_level)
 
 
@@ -615,9 +715,25 @@ class TextModulePanel(ModulePanel):
         super().__init__(dashboard, key, title, self.TEXT_OPTIONS, default_content)
 
     def build_body(self, parent):
-        self.text = tk.Text(parent, wrap="word", bg="#020617", fg="#e2e8f0", insertbackground="#e2e8f0", relief="flat")
+        self.text = tk.Text(
+            parent,
+            wrap="word",
+            bg="#020617",
+            fg="#e2e8f0",
+            insertbackground="#e2e8f0",
+            relief="flat",
+            font=ui_font("Consolas", 10),
+        )
         self.text.pack(fill="both", expand=True, padx=10, pady=10)
         self.text.config(state="disabled")
+
+    @staticmethod
+    def _eve_video_summary(encrypted, decrypted):
+        if encrypted is False:
+            return "plaintext stream"
+        if encrypted is True:
+            return "decrypted with EVE key" if decrypted else "noise / key mismatch"
+        return "--"
 
     def render(self):
         if self.card is None:
@@ -636,6 +752,10 @@ class TextModulePanel(ModulePanel):
         eve_noise = self.snapshot.get("eve_noise")
         eve_mac = self.snapshot.get("eve_mac")
         eve_csi = self.snapshot.get("eve_csi")
+        eve_raw = self.snapshot.get("eve_raw")
+        eve_key_status = self.snapshot.get("eve_key_status")
+        eve_video_encrypted = self.snapshot.get("eve_video_encrypted")
+        eve_video_decrypted = self.snapshot.get("eve_video_decrypted")
         epoch = self.snapshot.get("epoch")
         aes_key = self.snapshot.get("aes_key")
         video_encryption_enabled = self.snapshot.get("video_encryption_enabled")
@@ -648,8 +768,8 @@ class TextModulePanel(ModulePanel):
         demo = self.snapshot.get("demo")
         uav_demo = self.snapshot.get("uav_demo")
         demo_raw_kdr = self.snapshot.get("demo_raw_kdr")
-        demo_target_kdr = self.snapshot.get("demo_target_kdr")
-        demo_corr_kdr = self.snapshot.get("demo_corr_kdr")
+        demo_cnn_kdr = self.snapshot.get("demo_cnn_kdr")
+        demo_cnnq_kdr = self.snapshot.get("demo_cnnq_kdr")
         video_status = self.snapshot.get("video_status")
 
         if self.content_key == "key_status":
@@ -662,11 +782,14 @@ class TextModulePanel(ModulePanel):
                 f"video mode   : {'encrypted' if video_encryption_enabled else 'plaintext'}",
                 f"EVE seq      : {eve_serial if eve_serial is not None else '--'}",
                 f"EVE rssi/noise: {('--' if eve_rssi is None else f'{eve_rssi:.1f}')}/{('--' if eve_noise is None else f'{eve_noise:.1f}')}",
+                f"EVE raw key  : {short_bits(eve_raw)}",
+                f"EVE key      : {eve_key_status or '--'}",
+                f"EVE video    : {self._eve_video_summary(eve_video_encrypted, eve_video_decrypted)}",
                 f"active epoch : {epoch if epoch is not None else '--'}",
                 f"aes key      : {(aes_key.hex()[:48] + '...') if isinstance(aes_key, (bytes, bytearray)) else '--'}",
                 f"raw KDR      : {fmt_pct(demo_raw_kdr)}",
-                f"target KDR   : {fmt_pct(demo_target_kdr)}",
-                f"corrected KDR: {fmt_pct(demo_corr_kdr)}",
+                f"CNN KDR      : {fmt_pct(demo_cnn_kdr)}",
+                f"CNN-Q KDR    : {fmt_pct(demo_cnnq_kdr)}",
             ]
         elif self.content_key == "demo_keys":
             if not demo and not uav_demo:
@@ -689,8 +812,8 @@ class TextModulePanel(ModulePanel):
                     f"UAV CNN CSI      : {wave_summary(uav_demo.get('uav_cnn_csi'))}",
                     "",
                     f"raw KDR          : {fmt_pct(demo_raw_kdr)}",
-                    f"active target KDR: {fmt_pct(demo_target_kdr)}",
-                    f"corrected KDR    : {fmt_pct(demo_corr_kdr)}",
+                    f"CNN KDR          : {fmt_pct(demo_cnn_kdr)}",
+                    f"CNN-Q KDR        : {fmt_pct(demo_cnnq_kdr)}",
                 ]
             else:
                 pair_label = serial_pair_label(demo.get("serial_pair", (demo.get("serial", "--"),)))
@@ -698,8 +821,8 @@ class TextModulePanel(ModulePanel):
                     f"epoch/serials    : {demo.get('epoch', '--')}/{pair_label}",
                     f"UAV RSSI         : {demo.get('uav_rssi', ['--'])[0]}",
                     f"raw KDR          : {fmt_pct(demo.get('raw_kdr'))}",
-                    f"active target KDR: {fmt_pct(demo.get('active_target_kdr'))}",
-                    f"corrected KDR    : {fmt_pct(demo.get('corrected_kdr'))}",
+                    f"CNN KDR          : {fmt_pct(demo.get('cnn_kdr'))}",
+                    f"CNN-Q KDR        : {fmt_pct(demo.get('cnnq_kdr'))}",
                     "",
                     f"UAV raw key      : {short_bits(demo.get('uav_raw_key'))}",
                     f"UAV raw key 2    : {short_bits(demo.get('uav_raw_key_2'))}",
@@ -739,11 +862,14 @@ class TextModulePanel(ModulePanel):
                 f"EVE rssi      : {('--' if eve_rssi is None else f'{eve_rssi:.1f}')}",
                 f"EVE noise     : {('--' if eve_noise is None else f'{eve_noise:.1f}')}",
                 f"EVE CSI       : {wave_summary(eve_csi)}",
+                f"EVE raw key   : {short_bits(eve_raw)}",
+                f"EVE key       : {eve_key_status or '--'}",
+                f"EVE video     : {self._eve_video_summary(eve_video_encrypted, eve_video_decrypted)}",
                 f"latency raw   : {('--' if latency is None else f'{latency:.1f} ms')}",
                 f"latency avg   : {('--' if latency_ema is None else f'{latency_ema:.1f} ms')}",
                 f"raw KDR       : {fmt_pct(demo_raw_kdr)}",
-                f"target KDR    : {fmt_pct(demo_target_kdr)}",
-                f"corrected KDR : {fmt_pct(demo_corr_kdr)}",
+                f"CNN KDR       : {fmt_pct(demo_cnn_kdr)}",
+                f"CNN-Q KDR     : {fmt_pct(demo_cnnq_kdr)}",
                 f"corr bits     : {('--' if raw_kdr is None else f'{raw_kdr:.2f}%')}",
                 f"post-check    : {('--' if corr_kdr is None else f'{corr_kdr:.2f}%')}",
                 f"video status  : {video_status or '--'}",
@@ -809,7 +935,7 @@ class ChartModulePanel(ModulePanel):
 
         self.ax.clear()
         self.ax.set_facecolor("#020617")
-        self.ax.tick_params(colors="#cbd5e1")
+        self.ax.tick_params(colors="#cbd5e1", labelsize=ui_font_size(8))
         for spine in self.ax.spines.values():
             spine.set_color("#475569")
 
@@ -824,9 +950,9 @@ class ChartModulePanel(ModulePanel):
             if lat_ema_hist:
                 x_ema = list(range(len(lat_ema_hist)))
                 self.ax.plot(x_ema, lat_ema_hist, label="Latency", linewidth=2.0)
-            self.ax.set_title("Latency", color="#e5e7eb")
+            self.ax.set_title("Latency", color="#e5e7eb", fontsize=ui_font_size(10))
             if lat_hist or lat_ema_hist:
-                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8))
 
         elif self.content_key == "correction":
             raw_hist = list(self.snapshot.get("kdr_raw_hist", []))
@@ -838,23 +964,27 @@ class ChartModulePanel(ModulePanel):
                 x2 = list(range(len(corr_hist)))
                 self.ax.plot(x2, corr_hist, label="Post-check mismatch")
             self.ax.set_ylim(0, 100)
-            self.ax.set_title("Correction (%)", color="#e5e7eb")
+            self.ax.set_title("Correction (%)", color="#e5e7eb", fontsize=ui_font_size(10))
             if raw_hist or corr_hist:
-                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8))
 
         elif self.content_key == "demo_kdr":
             raw_hist = list(self.snapshot.get("demo_raw_kdr_hist", []))
-            corr_hist = list(self.snapshot.get("demo_corr_kdr_hist", []))
+            cnn_hist = list(self.snapshot.get("demo_cnn_kdr_hist", []))
+            cnnq_hist = list(self.snapshot.get("demo_cnnq_kdr_hist", []))
             if raw_hist:
                 x = list(range(len(raw_hist)))
                 self.ax.plot(x, raw_hist, label="Raw key KDR")
-            if corr_hist:
-                x2 = list(range(len(corr_hist)))
-                self.ax.plot(x2, corr_hist, label="Corrected key KDR")
+            if cnn_hist:
+                x2 = list(range(len(cnn_hist)))
+                self.ax.plot(x2, cnn_hist, label="CNN key KDR")
+            if cnnq_hist:
+                x3 = list(range(len(cnnq_hist)))
+                self.ax.plot(x3, cnnq_hist, label="CNN-Q key KDR")
             self.ax.set_ylim(0, 100)
-            self.ax.set_title("Demo Key KDR (%)", color="#e5e7eb")
-            if raw_hist or corr_hist:
-                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
+            self.ax.set_title("Demo Key KDR (%)", color="#e5e7eb", fontsize=ui_font_size(10))
+            if raw_hist or cnn_hist or cnnq_hist:
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8))
 
         elif self.content_key == "csi":
             demo = self.snapshot.get("demo") or {}
@@ -868,17 +998,18 @@ class ChartModulePanel(ModulePanel):
             ]
             plotted = False
             for label, values in series:
-                wave = self._normalized_wave(values)
+                wave = values
                 wave = savgol_filter(wave, min(9, len(wave) // 2 * 2 - 1), 3) if wave is not None and len(wave) >= 5 else wave
+                wave = self._normalized_wave(wave)
                 if wave is None:
                     continue
                 self.ax.plot(range(len(wave)), wave, label=label, linewidth=1.7)
                 plotted = True
-            self.ax.set_ylim(-0.05, 1.05)
+            # self.ax.set_ylim(-0.05, 1.05)
             self.ax.set_yticks([])
-            self.ax.set_title("CSI Waveform", color="#e5e7eb")
+            self.ax.set_title("CSI Waveform", color="#e5e7eb", fontsize=ui_font_size(10))
             if plotted:
-                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8))
 
         elif self.content_key == "live_csi":
             series = [
@@ -889,26 +1020,29 @@ class ChartModulePanel(ModulePanel):
             ]
             plotted = False
             for label, values in series:
-                wave = self._normalized_wave(values)
+                wave = values
                 wave = savgol_filter(wave, min(9, len(wave) // 2 * 2 - 1), 3) if wave is not None and len(wave) >= 5 else wave
+                wave = self._normalized_wave(wave)
                 if wave is None:
                     continue
                 self.ax.plot(range(len(wave)), wave, label=label, linewidth=1.8)
                 plotted = True
-            self.ax.set_ylim(-0.05, 1.05)
-            self.ax.set_title("Live CSI Waveform", color="#e5e7eb")
+            self.ax.set_ylim(-0.15, 1.15)
+            self.ax.set_title("Live CSI Waveform", color="#e5e7eb", fontsize=ui_font_size(10))
             self.ax.set_yticks([])
             if plotted:
-                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8))
 
         else:
             self.ax.set_xlim(0, 50)
             # self.ax.set_ylim(-100, 0)
             self.ax.set_xticks([])
             rssi_hist = list(self.snapshot.get("rssi_hist", []))
+            uav_rssi_hist = list(self.snapshot.get("uav_rssi_hist", []))
             eve_rssi_hist = list(self.snapshot.get("eve_rssi_hist", []))
             # ema
             rssi_ema_hist = []
+            uav_rssi_ema_hist = []
             eve_rssi_ema_hist = []
             for rssi in rssi_hist:
                 if rssi_ema_hist:
@@ -916,6 +1050,12 @@ class ChartModulePanel(ModulePanel):
                 else:
                     new_ema = rssi
                 rssi_ema_hist.append(new_ema)
+            for uav_rssi in uav_rssi_hist:
+                if uav_rssi_ema_hist:
+                    new_ema = 0.3 * uav_rssi + 0.7 * uav_rssi_ema_hist[-1]
+                else:
+                    new_ema = uav_rssi
+                uav_rssi_ema_hist.append(new_ema)
             for eve_rssi in eve_rssi_hist:
                 if eve_rssi_ema_hist:
                     new_ema = 0.3 * eve_rssi + 0.7 * eve_rssi_ema_hist[-1]
@@ -925,12 +1065,15 @@ class ChartModulePanel(ModulePanel):
             if rssi_hist:
                 x = list(range(len(rssi_hist)))
                 self.ax.plot(x, rssi_ema_hist, label="GSN RSSI", linewidth=2.0)
+            if uav_rssi_hist:
+                x2 = list(range(len(uav_rssi_hist)))
+                self.ax.plot(x2, uav_rssi_ema_hist, label="UAV RSSI", linewidth=1.7, alpha=0.9)
             if eve_rssi_hist:
                 x3 = list(range(len(eve_rssi_hist)))
                 self.ax.plot(x3, eve_rssi_ema_hist, label="EVE RSSI", linewidth=1.7, alpha=0.9)
-            self.ax.set_title("RSSI / Noise", color="#e5e7eb")
-            if rssi_hist or eve_rssi_hist:
-                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb")
+            self.ax.set_title("RSSI / Noise", color="#e5e7eb", fontsize=ui_font_size(10))
+            if rssi_hist or uav_rssi_hist or eve_rssi_hist:
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8))
 
         self.canvas.draw_idle()
 
@@ -950,6 +1093,7 @@ class ControlModulePanel(ModulePanel):
             fg="#e2e8f0",
             insertbackground="#e2e8f0",
             relief="flat",
+            font=ui_font("Consolas", 10),
         )
         self.summary.pack(fill="both", expand=True, padx=10, pady=10)
         self.summary.config(state="disabled")
@@ -981,13 +1125,15 @@ class StatsStrip:
         self.frame = tk.Frame(parent, bg=SURFACE_BG)
         self.frame.pack(fill="x", pady=(0, 10))
         self.cards = {}
+        self.kdr_value_labels = {}
+        self.card_keys = []
         self.card_widgets = []
         self.current_columns = None
         specs = [
             ("serial", "Latest Serial", "Stream sequence", ACCENT_BLUE),
             ("rssi", "RSSI", "Radio strength", ACCENT_TEAL),
             ("noise", "Noise", "Channel floor", ACCENT_AMBER),
-            ("epoch", "Active Epoch", "Confirmed key window", ACCENT_VIOLET),
+            # ("epoch", "Active Epoch", "Confirmed key window", ACCENT_VIOLET),
             ("latency", "Latency (ms)", "End-to-end response", ACCENT_PINK),
             ("kdr", "Key KDR", "Raw / corrected mismatch", ACCENT_GREEN),
         ]
@@ -996,11 +1142,32 @@ class StatsStrip:
             tk.Frame(card, bg=accent, height=2).pack(fill="x")
             inner = tk.Frame(card, bg=CARD_BG, padx=12, pady=8)
             inner.pack(fill="both", expand=True)
-            tk.Label(inner, text=title.upper(), bg=CARD_BG, fg=TEXT_SOFT, font=("Arial", 8, "bold")).pack(anchor="w")
-            value = tk.Label(inner, text="--", bg=CARD_BG, fg=TEXT_MAIN, font=("Consolas", 13, "bold"))
-            value.pack(anchor="w", pady=(5, 1))
-            tk.Label(inner, text=subtitle, bg=CARD_BG, fg=TEXT_MUTED, font=("Arial", 7)).pack(anchor="w")
-            self.cards[key] = value
+            tk.Label(inner, text=title.upper(), bg=CARD_BG, fg=TEXT_SOFT, font=ui_font("Arial", 8, "bold")).pack(anchor="w")
+            if key == "kdr":
+                value_row = tk.Frame(inner, bg=CARD_BG)
+                value_row.pack(fill="x", pady=(5, 1))
+                for metric_idx, (metric, label) in enumerate((("raw", "Raw"), ("cnn", "CNN"), ("cnnq", "CNN-Q"))):
+                    value = tk.Label(
+                        value_row,
+                        text=f"{label}: --",
+                        bg=CARD_BG,
+                        fg=TEXT_MAIN,
+                        font=ui_font("Consolas", 13, "bold"),
+                        anchor="w",
+                    )
+                    value.pack(
+                        side="left",
+                        fill="x",
+                        expand=True,
+                        padx=(0, 14 if metric_idx < 2 else 0),
+                    )
+                    self.kdr_value_labels[metric] = value
+            else:
+                value = tk.Label(inner, text="--", bg=CARD_BG, fg=TEXT_MAIN, font=ui_font("Consolas", 13, "bold"))
+                value.pack(anchor="w", pady=(5, 1))
+                self.cards[key] = value
+            tk.Label(inner, text=subtitle, bg=CARD_BG, fg=TEXT_MUTED, font=ui_font("Arial", 7)).pack(anchor="w")
+            self.card_keys.append(key)
             self.card_widgets.append(card)
         self._layout_cards(6)
         self.frame.bind("<Configure>", self._on_configure)
@@ -1023,34 +1190,49 @@ class StatsStrip:
             self.frame.rowconfigure(idx, weight=0)
         for idx in range(columns):
             self.frame.columnconfigure(idx, weight=1, uniform="stats")
-        for idx, card in enumerate(self.card_widgets):
-            row = idx // columns
-            col = idx % columns
-            top_pad = 0 if row == 0 else 8
-            card.grid(row=row, column=col, sticky="nsew", padx=5, pady=(top_pad, 0))
 
-    def update(self, serial, rssi, noise, epoch, latency, latency_ema, raw_kdr, corr_kdr):
+        row = 0
+        col = 0
+        for key, card in zip(self.card_keys, self.card_widgets):
+            span = 2 if key == "kdr" else 1
+            span = min(span, columns)
+            if col + span > columns:
+                row += 1
+                col = 0
+            top_pad = 0 if row == 0 else 8
+            card.grid(
+                row=row,
+                column=col,
+                columnspan=span,
+                sticky="nsew",
+                padx=5,
+                pady=(top_pad, 0),
+            )
+            col += span
+            if col >= columns:
+                row += 1
+                col = 0
+
+    def update(self, serial, rssi, noise, epoch, latency, latency_ema, raw_kdr, cnn_kdr, cnnq_kdr):
         self.cards["serial"].config(text="--" if serial is None else str(serial))
         self.cards["rssi"].config(text="--" if rssi is None else f"{rssi:.1f}")
         self.cards["noise"].config(text="--" if noise is None else f"{noise:.1f}")
-        self.cards["epoch"].config(text="--" if epoch is None else str(epoch))
+        # self.cards["epoch"].config(text="--" if epoch is None else str(epoch))
         if latency is None:
             self.cards["latency"].config(text="--")
         elif latency_ema is None:
             self.cards["latency"].config(text=f"{latency:.1f}")
         else:
             self.cards["latency"].config(text=f"{latency_ema:.1f} avg")
-        if raw_kdr is None:
-            self.cards["kdr"].config(text="--")
-        elif corr_kdr is None:
-            self.cards["kdr"].config(text=f"{raw_kdr:.2f}%")
-        else:
-            self.cards["kdr"].config(text=f"{raw_kdr:.2f}% / {corr_kdr:.2f}%")
+        self.kdr_value_labels["raw"].config(text=f"Raw: {'--' if raw_kdr is None else f'{raw_kdr:.1f}%'}")
+        self.kdr_value_labels["cnn"].config(text=f"CNN: {'--' if cnn_kdr is None else f'{cnn_kdr:.1f}%'}")
+        self.kdr_value_labels["cnnq"].config(text=f"CNN-Q: {'--' if cnnq_kdr is None else f'{cnnq_kdr:.1f}%'}")
 
 
 class GSNDashboard(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.option_add("*Font", ui_font("Arial", 10))
         self.title("GSN Dashboard - PLKG Ground Station")
         self.geometry("1366x768")
         self.minsize(800, 500)
@@ -1071,6 +1253,7 @@ class GSNDashboard(tk.Tk):
         self.layout_presets = []
         self.default_hosts = {}
         self.active_top_dropdown = None
+        self.font_scale_var = tk.StringVar(value=self._font_scale_text())
 
         self._configure_style()
         self._build_layout()
@@ -1087,25 +1270,26 @@ class GSNDashboard(tk.Tk):
         style.configure("Root.TFrame", background=APP_BG)
         style.configure("Card.TFrame", background=CARD_BG, relief="flat")
         style.configure("Shell.TFrame", background=SURFACE_BG, relief="flat")
-        style.configure("Title.TLabel", background=CARD_BG, foreground=TEXT_MAIN, font=("Arial", 12, "bold"))
-        style.configure("MetricTitle.TLabel", background=CARD_BG, foreground=TEXT_SOFT, font=("Arial", 9, "bold"))
-        style.configure("Muted.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Arial", 10))
-        style.configure("Header.TLabel", background=CARD_BG, foreground=TEXT_MAIN, font=("Arial", 16, "bold"))
-        style.configure("SubHeader.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Arial", 9))
-        style.configure("StatusBanner.TLabel", background=CARD_BG, foreground=ACCENT_BLUE, font=("Consolas", 10, "bold"))
-        style.configure("SectionTitle.TLabel", background=CARD_BG, foreground=TEXT_MAIN, font=("Arial", 11, "bold"))
-        style.configure("SectionMeta.TLabel", background=CARD_BG, foreground=TEXT_SOFT, font=("Arial", 8))
-        style.configure("Badge.TLabel", background=CARD_BG_ALT, foreground=TEXT_MUTED, font=("Arial", 8, "bold"))
-        style.configure("TButton", font=("Arial", 10, "bold"), padding=(9, 6))
-        style.configure("StatusIdle.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Arial", 10, "bold"))
-        style.configure("StatusWarn.TLabel", background=CARD_BG, foreground=ACCENT_AMBER, font=("Arial", 10, "bold"))
-        style.configure("StatusGood.TLabel", background=CARD_BG, foreground=ACCENT_GREEN, font=("Arial", 10, "bold"))
-        style.configure("StatusBad.TLabel", background=CARD_BG, foreground="#fb7185", font=("Arial", 10, "bold"))
+        style.configure("Title.TLabel", background=CARD_BG, foreground=TEXT_MAIN, font=ui_font("Arial", 12, "bold"))
+        style.configure("MetricTitle.TLabel", background=CARD_BG, foreground=TEXT_SOFT, font=ui_font("Arial", 9, "bold"))
+        style.configure("Muted.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=ui_font("Arial", 10))
+        style.configure("Header.TLabel", background=CARD_BG, foreground=TEXT_MAIN, font=ui_font("Arial", 16, "bold"))
+        style.configure("SubHeader.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=ui_font("Arial", 9))
+        style.configure("StatusBanner.TLabel", background=CARD_BG, foreground=ACCENT_BLUE, font=ui_font("Consolas", 10, "bold"))
+        style.configure("SectionTitle.TLabel", background=CARD_BG, foreground=TEXT_MAIN, font=ui_font("Arial", 11, "bold"))
+        style.configure("SectionMeta.TLabel", background=CARD_BG, foreground=TEXT_SOFT, font=ui_font("Arial", 8))
+        style.configure("Badge.TLabel", background=CARD_BG_ALT, foreground=TEXT_MUTED, font=ui_font("Arial", 8, "bold"))
+        style.configure("TButton", font=ui_font("Arial", 10, "bold"), padding=(9, 6))
+        style.configure("StatusIdle.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=ui_font("Arial", 10, "bold"))
+        style.configure("StatusWarn.TLabel", background=CARD_BG, foreground=ACCENT_AMBER, font=ui_font("Arial", 10, "bold"))
+        style.configure("StatusGood.TLabel", background=CARD_BG, foreground=ACCENT_GREEN, font=ui_font("Arial", 10, "bold"))
+        style.configure("StatusBad.TLabel", background=CARD_BG, foreground="#fb7185", font=ui_font("Arial", 10, "bold"))
         style.configure(
             "Panel.TCombobox",
             fieldbackground=CARD_BG_ALT,
             background=CARD_BG_ALT,
             foreground=TEXT_MAIN,
+            font=ui_font("Arial", 9),
             arrowcolor=ACCENT_BLUE,
             bordercolor=CARD_BORDER,
             lightcolor=CARD_BORDER,
@@ -1120,6 +1304,60 @@ class GSNDashboard(tk.Tk):
             selectbackground=[("readonly", CARD_BG_ALT)],
             selectforeground=[("readonly", TEXT_MAIN)],
         )
+
+    def _font_scale_text(self):
+        return f"{int(round(GUI_FONT_SCALE * 100))}%"
+
+    def change_font_scale(self, delta):
+        self.set_font_scale(GUI_FONT_SCALE + delta)
+
+    def set_font_scale(self, value):
+        old_scale, new_scale = set_gui_font_scale(value)
+        if abs(old_scale - new_scale) < 1e-6:
+            return
+
+        self.option_add("*Font", ui_font("Arial", 10))
+        self.font_scale_var.set(self._font_scale_text())
+        self._configure_style()
+        self._apply_font_scale(self, old_scale)
+        for panel in self.panels.values():
+            panel.render()
+
+    def _apply_font_scale(self, widget, old_scale):
+        self._scale_widget_font(widget, old_scale)
+        for child in widget.winfo_children():
+            self._apply_font_scale(child, old_scale)
+
+    def _scale_widget_font(self, widget, old_scale):
+        try:
+            font_value = widget.cget("font")
+        except tk.TclError:
+            return
+        if not font_value:
+            return
+
+        try:
+            base_font = getattr(widget, "_plkg_base_font", None)
+            if base_font is None:
+                font_obj = tkfont.Font(root=self, font=font_value)
+                actual = font_obj.actual()
+                size = abs(int(actual.get("size", 10)))
+                styles = []
+                if actual.get("weight") == "bold":
+                    styles.append("bold")
+                if actual.get("slant") == "italic":
+                    styles.append("italic")
+                base_font = (
+                    actual.get("family", "Arial"),
+                    max(1.0, size / max(old_scale, 0.01)),
+                    tuple(styles),
+                )
+                widget._plkg_base_font = base_font
+
+            family, base_size, styles = base_font
+            widget.configure(font=(family, ui_font_size(base_size), *styles))
+        except Exception:
+            return
 
     def _build_layout(self):
         root = ttk.Frame(self, style="Root.TFrame", padding=12)
@@ -1140,7 +1378,7 @@ class GSNDashboard(tk.Tk):
             text="Ground Station / PLKG Live Ops",
             bg=CARD_BG,
             fg=TEXT_MUTED,
-            font=("Arial", 9),
+            font=ui_font("Arial", 9),
         ).pack(anchor="w", pady=(2, 0))
 
         status_shell = tk.Frame(
@@ -1153,8 +1391,8 @@ class GSNDashboard(tk.Tk):
             pady=6,
         )
         status_shell.pack(side="left", padx=(12, 10))
-        tk.Label(status_shell, text="BACKEND", bg=CARD_BG_ALT, fg=TEXT_SOFT, font=("Arial", 8, "bold")).pack(anchor="e")
-        self.status_banner = tk.Label(status_shell, text="OFF", bg=CARD_BG_ALT, fg=TEXT_MUTED, font=("Consolas", 9, "bold"))
+        tk.Label(status_shell, text="BACKEND", bg=CARD_BG_ALT, fg=TEXT_SOFT, font=ui_font("Arial", 8, "bold")).pack(anchor="e")
+        self.status_banner = tk.Label(status_shell, text="OFF", bg=CARD_BG_ALT, fg=TEXT_MUTED, font=ui_font("Consolas", 9, "bold"))
         self.status_banner.pack(anchor="e", pady=(3, 0))
 
         controls = tk.Frame(top_inner, bg=CARD_BG)
@@ -1169,6 +1407,20 @@ class GSNDashboard(tk.Tk):
         self.clear_btn.pack(side="left", padx=(0, 6))
         self.reset_layout_btn = ttk.Button(controls, text="Reset", command=self.reset_layout)
         self.reset_layout_btn.pack(side="left", padx=(0, 9))
+        tk.Frame(controls, bg=CARD_BORDER_SOFT, width=1, height=26).pack(side="left", padx=(0, 9), pady=2)
+        self.font_down_btn = ttk.Button(controls, text="A-", command=lambda: self.change_font_scale(-0.05), width=3)
+        self.font_down_btn.pack(side="left", padx=(0, 4))
+        self.font_scale_label = tk.Label(
+            controls,
+            textvariable=self.font_scale_var,
+            bg=CARD_BG,
+            fg=TEXT_MUTED,
+            font=ui_font("Consolas", 9, "bold"),
+            width=5,
+        )
+        self.font_scale_label.pack(side="left", padx=(0, 4))
+        self.font_up_btn = ttk.Button(controls, text="A+", command=lambda: self.change_font_scale(0.05), width=3)
+        self.font_up_btn.pack(side="left", padx=(0, 9))
         tk.Frame(controls, bg=CARD_BORDER_SOFT, width=1, height=26).pack(side="left", padx=(0, 9), pady=2)
         self.panel_menu_button = ttk.Button(controls, text="Modules", command=self._toggle_panel_dropdown)
         self.panel_menu_button.pack(side="left", padx=(0, 6))
@@ -1202,17 +1454,17 @@ class GSNDashboard(tk.Tk):
         workspace.add(footer, weight=0)
 
         self.panel_hosts["primary"] = PanelHost(left_stack, "primary", "Empty slot")
-        self.panel_hosts["auxiliary"] = PanelHost(left_stack, "auxiliary", "Empty slot")
+        # self.panel_hosts["auxiliary"] = PanelHost(left_stack, "auxiliary", "Empty slot")
         self.panel_hosts["secondary"] = PanelHost(right_stack, "secondary", "Empty slot")
-        self.panel_hosts["tertiary"] = PanelHost(right_stack, "tertiary", "Empty slot")
+        # self.panel_hosts["tertiary"] = PanelHost(right_stack, "tertiary", "Empty slot")
         self.panel_hosts["analytics_left"] = PanelHost(bottom_row, "analytics_left", "Empty slot")
         self.panel_hosts["analytics_right"] = PanelHost(bottom_row, "analytics_right", "Empty slot")
         self.panel_hosts["footer"] = PanelHost(footer, "footer", "Empty slot")
 
         left_stack.add(self.panel_hosts["primary"], weight=6)
-        left_stack.add(self.panel_hosts["auxiliary"], weight=1)
+        # left_stack.add(self.panel_hosts["auxiliary"], weight=1)
         right_stack.add(self.panel_hosts["secondary"], weight=1)
-        right_stack.add(self.panel_hosts["tertiary"], weight=1)
+        # right_stack.add(self.panel_hosts["tertiary"], weight=1)
         main_row.add(left_stack, weight=6)
         main_row.add(right_stack, weight=2)
         bottom_row.add(self.panel_hosts["analytics_left"], weight=1)
@@ -1221,11 +1473,11 @@ class GSNDashboard(tk.Tk):
 
         self.default_hosts = {
             "media_main": self.panel_hosts["primary"],
-            "control_panel": self.panel_hosts["auxiliary"],
+            # "control_panel": self.panel_hosts["auxiliary"],
             "text_main": self.panel_hosts["analytics_left"],
             "text_aux": self.panel_hosts["footer"],
             "chart_main": self.panel_hosts["secondary"],
-            "chart_aux": self.panel_hosts["tertiary"],
+            # "chart_aux": self.panel_hosts["tertiary"],
             "text_log": self.panel_hosts["analytics_right"],
         }
         self._init_panels()
@@ -1235,11 +1487,11 @@ class GSNDashboard(tk.Tk):
 
     def _init_panels(self):
         self.panels = {
-            "media_main": VideoModulePanel(self, "media_main", "Decrypted Video", "video"),
+            "media_main": VideoModulePanel(self, "media_main", "Video Stream", "video"),
             "control_panel": ControlModulePanel(self, "control_panel", "System State", "session"),
             "text_main": TextModulePanel(self, "text_main", "Demo Key Snapshot", "demo_keys"),
             "text_aux": TextModulePanel(self, "text_aux", "Epoch History", "epoch_history"),
-            "chart_main": ChartModulePanel(self, "chart_main", "Demo KDR", "demo_kdr"),
+            "chart_main": ChartModulePanel(self, "chart_main", "Data Chart", "live_csi"),
             "chart_aux": ChartModulePanel(self, "chart_aux", "Live CSI", "live_csi"),
             "text_log": TextModulePanel(self, "text_log", "System Log", "epoch_history"),
         }
@@ -1249,7 +1501,7 @@ class GSNDashboard(tk.Tk):
             "text_main": True,
             "text_aux": False,
             "chart_main": True,
-            "chart_aux": True,
+            "chart_aux": False,
             "text_log": True,
         }
         for key, panel in self.panels.items():
@@ -1259,12 +1511,12 @@ class GSNDashboard(tk.Tk):
 
     def _init_panel_menu(self):
         self.panel_menu_labels = {
-            "media_main": "Decrypted Video",
+            "media_main": "Video Stream",
             "control_panel": "System State",
             "text_main": "Demo Key Snapshot",
             "text_aux": "Epoch History",
-            "chart_main": "Demo KDR",
-            "chart_aux": "Live CSI",
+            "chart_main": "Data Chart",
+            "chart_aux": "Aux Chart",
             "text_log": "System Log",
         }
         for key in self.panel_menu_labels:
@@ -1331,7 +1583,7 @@ class GSNDashboard(tk.Tk):
                 activebackground=CARD_BG_ALT,
                 activeforeground=TEXT_MAIN,
                 selectcolor=CARD_BG_ALT,
-                font=("Arial", 9, "bold"),
+                font=ui_font("Arial", 9, "bold"),
                 relief="flat",
                 bd=0,
                 highlightthickness=0,
@@ -1352,7 +1604,7 @@ class GSNDashboard(tk.Tk):
                 fg=TEXT_MAIN,
                 activebackground=CARD_BORDER_SOFT,
                 activeforeground=TEXT_MAIN,
-                font=("Arial", 9, "bold"),
+                font=ui_font("Arial", 9, "bold"),
                 relief="flat",
                 bd=0,
                 highlightthickness=0,
@@ -1541,6 +1793,7 @@ class GSNDashboard(tk.Tk):
             self.state_obj.latest_eve_video_bgr = None
             self.state_obj.latest_eve_video_time = None
             self.state_obj.latest_eve_video_encrypted = None
+            self.state_obj.latest_eve_video_decrypted = None
 
         command = f"VIDEO_ENCRYPTION {'1' if enabled else '0'}".encode("ascii")
         try:
@@ -1601,6 +1854,7 @@ class GSNDashboard(tk.Tk):
                 get_aes_key=self._get_key,
                 on_frame=self._handle_frame,
                 on_eve_frame=self._handle_eve_frame,
+                get_eve_aes_key=self._get_eve_key,
             )
             rx.start()
             with self.state_obj.lock:
@@ -1644,8 +1898,16 @@ class GSNDashboard(tk.Tk):
                         if eve_serial != last_eve_serial:
                             last_eve_serial = eve_serial
                             eve_csi = eve.get("csi")
+                            eve_raw = None
+                            eve_aes = None
+                            eve_key_error = None
                             if eve_csi is not None:
                                 eve_csi = np.asarray(eve_csi, dtype=np.float32)
+                                if eve_csi.ndim == 1 and len(eve_csi) >= 10:
+                                    try:
+                                        eve_raw, eve_aes = generate_key(eve_csi)
+                                    except Exception as exc:
+                                        eve_key_error = str(exc)
                             with self.state_obj.lock:
                                 self.state_obj.latest_eve_serial = eve_serial
                                 self.state_obj.latest_eve_rssi = eve.get("rssi")
@@ -1653,6 +1915,16 @@ class GSNDashboard(tk.Tk):
                                 self.state_obj.latest_eve_mac = eve.get("mac")
                                 self.state_obj.latest_eve_csi_time = eve.get("time")
                                 self.state_obj.latest_eve_csi = None if eve_csi is None else eve_csi.copy()
+                                if eve_raw is not None and eve_aes is not None and eve_serial is not None:
+                                    self.state_obj.latest_eve_raw = eve_raw
+                                    self.state_obj.latest_eve_aes_key = eve_aes
+                                    self.state_obj.latest_eve_key_status = f"EVE raw key ready from serial {eve_serial}."
+                                    self.state_obj.eve_raw_by_serial[eve_serial] = eve_raw
+                                    self.state_obj.eve_aes_by_serial[eve_serial] = eve_aes
+                                    self._trim_dict_locked(self.state_obj.eve_raw_by_serial, RAW_HISTORY_LIMIT)
+                                    self._trim_dict_locked(self.state_obj.eve_aes_by_serial, RAW_HISTORY_LIMIT)
+                                elif eve_key_error:
+                                    self.state_obj.latest_eve_key_status = f"EVE keygen failed: {eve_key_error}"
                                 if eve.get("rssi") is not None:
                                     self.state_obj.eve_rssi_hist.append(eve.get("rssi"))
                                 if eve.get("noise") is not None:
@@ -1660,7 +1932,8 @@ class GSNDashboard(tk.Tk):
                             if isinstance(eve_serial, int) and eve_serial % 20 == 0:
                                 self.log(
                                     f"Read EVE CSI seq {eve_serial} "
-                                    f"rssi={eve.get('rssi', '--')} noise={eve.get('noise', '--')}."
+                                    f"rssi={eve.get('rssi', '--')} noise={eve.get('noise', '--')} "
+                                    f"key={'ready' if eve_raw is not None else '--'}."
                                 )
 
                 snap = watcher.snapshot().get("GSN")
@@ -1710,6 +1983,45 @@ class GSNDashboard(tk.Tk):
                 self.log(f"Keygen loop error: {e}")
                 time.sleep(0.1)
 
+    def _try_eve_epoch_key(self, epoch, serial_pair, serial_token, helper, confirm):
+        serial_pair = parse_serial_pair(serial_pair)
+        serial = serial_pair[0]
+        with self.state_obj.lock:
+            if epoch in self.state_obj.eve_keys_by_epoch:
+                return "already", f"EVE key already ready for epoch={epoch}."
+            eve_raw = self.state_obj.eve_raw_by_serial.get(serial)
+            raw_source = f"serial {serial}"
+            if eve_raw is None and self.state_obj.latest_eve_raw is not None:
+                eve_raw = self.state_obj.latest_eve_raw
+                raw_source = f"latest serial {self.state_obj.latest_eve_serial if self.state_obj.latest_eve_serial is not None else '--'}"
+
+        if eve_raw is None:
+            message = f"EVE waiting for CSI before trying epoch={epoch} key."
+            with self.state_obj.lock:
+                self.state_obj.latest_eve_key_status = message
+            return "missing", message
+
+        try:
+            eve_corrected = bch_decode_key(eve_raw, helper)
+        except ValueError as exc:
+            message = f"EVE key mismatch for epoch={epoch} ({raw_source}); showing encrypted noise."
+            with self.state_obj.lock:
+                self.state_obj.latest_eve_key_status = message
+            return "failed", f"{message} {exc}"
+
+        eve_aes = sha256.sha_byte(eve_corrected)
+        if not verify_key_confirm(eve_aes, epoch, serial_token, helper, confirm):
+            message = f"EVE key confirmation failed for epoch={epoch} ({raw_source}); showing encrypted noise."
+            with self.state_obj.lock:
+                self.state_obj.latest_eve_key_status = message
+            return "failed", message
+
+        with self.state_obj.lock:
+            self.state_obj.eve_keys_by_epoch[epoch] = eve_aes
+            self._trim_dict_locked(self.state_obj.eve_keys_by_epoch, RAW_HISTORY_LIMIT)
+            self.state_obj.latest_eve_key_status = f"EVE key ready for epoch {epoch} from {raw_source}."
+        return "ready", f"EVE key ready for epoch={epoch} from {raw_source}; encrypted video will be tried with EVE key."
+
     def _bch_worker(self):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1726,6 +2038,9 @@ class GSNDashboard(tk.Tk):
         rejected_epochs = set()
         seen_helper_epochs = set()
         waiting_serial_epochs = set()
+        eve_key_logged_epochs = set()
+        eve_key_failed_epochs = set()
+        eve_key_missing_epochs = set()
         while True:
             try:
                 data, addr = sock.recvfrom(1024*1024)
@@ -1783,7 +2098,25 @@ class GSNDashboard(tk.Tk):
                     self.log(f"UAV key session reset detected: epoch {last_epoch}->{epoch}")
                     rejected_epochs.clear()
                     waiting_serial_epochs.clear()
+                    eve_key_logged_epochs.clear()
+                    eve_key_failed_epochs.clear()
+                    eve_key_missing_epochs.clear()
                 last_epoch = epoch
+
+                with self.state_obj.lock:
+                    self.state_obj.epoch_serial_by_epoch[epoch] = serial_pair
+                    self._trim_dict_locked(self.state_obj.epoch_serial_by_epoch, RAW_HISTORY_LIMIT)
+
+                eve_status, eve_message = self._try_eve_epoch_key(epoch, serial_pair, serial_token, helper, confirm)
+                if eve_status == "ready" and epoch not in eve_key_logged_epochs:
+                    eve_key_logged_epochs.add(epoch)
+                    self.log(eve_message)
+                elif eve_status == "failed" and epoch not in eve_key_failed_epochs:
+                    eve_key_failed_epochs.add(epoch)
+                    self.log(eve_message)
+                elif eve_status == "missing" and epoch not in eve_key_missing_epochs:
+                    eve_key_missing_epochs.add(epoch)
+                    self.log(eve_message)
 
                 with self.state_obj.lock:
                     if epoch in self.state_obj.keys_by_epoch:
@@ -1817,6 +2150,10 @@ class GSNDashboard(tk.Tk):
                         )
                     continue
 
+                with self.state_obj.lock:
+                    self.state_obj.epoch_serial_by_epoch[epoch] = serial_pair
+                    self._trim_dict_locked(self.state_obj.epoch_serial_by_epoch, RAW_HISTORY_LIMIT)
+
                 try:
                     corrected = bch_decode_key(local_raw, helper)
                 except ValueError as e:
@@ -1841,6 +2178,7 @@ class GSNDashboard(tk.Tk):
                             f"BCH correction failed for epoch={epoch}. Waiting for next helper."
                         )
                         self.state_obj.video_status_level = "warn"
+                        self._refresh_demo_snapshot_locked(epoch)
                     hint = "" if not kdr_hints else " " + " ".join(kdr_hints)
                     self.log(f"BCH correction failed for epoch={epoch}, serials={serial_pair_label(serial_pair)}:{hint} {e}")
                     continue
@@ -1928,6 +2266,10 @@ class GSNDashboard(tk.Tk):
                         self.state_obj.latest_uav_live_cnn_serial_pair = payload.get("cnn_serial_pair")
                         self.state_obj.latest_uav_live_epoch = payload.get("epoch")
                         self.state_obj.latest_uav_live_csi_time = payload.get("time", time.time())
+                        if "uav_rssi" in payload and payload["uav_rssi"]:
+                            uav_rssi_val = payload["uav_rssi"][0] if isinstance(payload["uav_rssi"], list) else payload["uav_rssi"]
+                            if uav_rssi_val is not None:
+                                self.state_obj.uav_rssi_hist.append(float(uav_rssi_val))
                     continue
                 epoch = payload["epoch"]
                 serial = payload["serial"]
@@ -1935,6 +2277,13 @@ class GSNDashboard(tk.Tk):
                     self.state_obj.uav_demo_by_epoch[epoch] = payload
                     self.state_obj.latest_uav_demo = dict(payload)
                     self.state_obj.latest_demo_telemetry_time = payload.get("time", time.time())
+                    
+                    # Append UAV RSSI to history if available
+                    if "uav_rssi" in payload and payload["uav_rssi"]:
+                        uav_rssi_val = payload["uav_rssi"][0] if isinstance(payload["uav_rssi"], list) else payload["uav_rssi"]
+                        if uav_rssi_val is not None:
+                            self.state_obj.uav_rssi_hist.append(float(uav_rssi_val))
+
                     self._trim_dict_locked(self.state_obj.uav_demo_by_epoch, RAW_HISTORY_LIMIT)
                     demo_snapshot = self._refresh_demo_snapshot_locked(epoch)
                 if epoch not in raw_logged_epochs:
@@ -1965,6 +2314,7 @@ class GSNDashboard(tk.Tk):
     def _clear_demo_session_locked(self):
         self.state_obj.gsn_corrected_by_epoch.clear()
         self.state_obj.epoch_serial_by_epoch.clear()
+        self.state_obj.eve_keys_by_epoch.clear()
         self.state_obj.uav_demo_by_epoch.clear()
         self.state_obj.latest_uav_demo = None
         self.state_obj.latest_demo = None
@@ -1979,17 +2329,23 @@ class GSNDashboard(tk.Tk):
         self.state_obj.latest_gsn_live_csi = None
         self.state_obj.latest_gsn_live_csi_time = None
         self.state_obj.latest_demo_raw_kdr = None
-        self.state_obj.latest_demo_target_kdr = None
-        self.state_obj.latest_demo_corr_kdr = None
+        self.state_obj.latest_demo_cnn_kdr = None
+        self.state_obj.latest_demo_cnnq_kdr = None
+        self.state_obj.latest_eve_video_bgr = None
+        self.state_obj.latest_eve_video_time = None
+        self.state_obj.latest_eve_video_encrypted = None
+        self.state_obj.latest_eve_video_decrypted = None
+        self.state_obj.latest_eve_key_status = "Waiting for EVE epoch key."
         self.state_obj.demo_raw_kdr_hist.clear()
-        self.state_obj.demo_corr_kdr_hist.clear()
+        self.state_obj.demo_cnn_kdr_hist.clear()
+        self.state_obj.demo_cnnq_kdr_hist.clear()
         self.state_obj.demo_hist_epochs.clear()
 
     def _refresh_demo_snapshot_locked(self, epoch):
         uav_demo = self.state_obj.uav_demo_by_epoch.get(epoch)
         gsn_corrected_key = self.state_obj.gsn_corrected_by_epoch.get(epoch)
         serial_pair = self.state_obj.epoch_serial_by_epoch.get(epoch)
-        if not uav_demo or gsn_corrected_key is None or serial_pair is None:
+        if not uav_demo or serial_pair is None:
             return None
         serial_pair = parse_serial_pair(serial_pair)
         if parse_serial_pair(uav_demo.get("serial_pair", (uav_demo.get("serial"),))) != serial_pair:
@@ -2004,9 +2360,9 @@ class GSNDashboard(tk.Tk):
         if gsn_raw_key is None or gsn_raw_key_2 is None or gsn_raw_csi is None or gsn_raw_csi_2 is None:
             return None
 
-        raw_kdr = self._kdr(gsn_raw_key, uav_demo["uav_raw_key"]) * 100.0
-        active_target_kdr = self._kdr(gsn_raw_key, uav_demo["uav_corrected_key"]) * 100.0
-        corrected_kdr = self._kdr(gsn_corrected_key, uav_demo["uav_corrected_key"]) * 100.0
+        raw_kdr = self._kdr(gsn_raw_key, uav_demo.get("uav_raw_key")) * 100.0
+        cnn_kdr = self._kdr(gsn_raw_key, uav_demo.get("uav_cnn_key")) * 100.0 if uav_demo.get("uav_cnn_key") else None
+        cnnq_kdr = self._kdr(gsn_raw_key, uav_demo.get("uav_cnnq_key")) * 100.0 if uav_demo.get("uav_cnnq_key") else None
         snapshot = {
             "epoch": epoch,
             "serial": serial,
@@ -2017,27 +2373,30 @@ class GSNDashboard(tk.Tk):
             "uav_cnn_csi": uav_demo.get("uav_cnn_csi"),
             "gsn_raw_csi": np.asarray(gsn_raw_csi, dtype=np.float32).tolist(),
             "gsn_raw_csi_2": np.asarray(gsn_raw_csi_2, dtype=np.float32).tolist(),
-            "uav_raw_key": uav_demo["uav_raw_key"],
+            "uav_raw_key": uav_demo.get("uav_raw_key"),
             "uav_raw_key_2": uav_demo.get("uav_raw_key_2"),
             "gsn_raw_key": gsn_raw_key,
             "gsn_raw_key_2": gsn_raw_key_2,
             "uav_cnn_key": uav_demo.get("uav_cnn_key"),
             "uav_cnnq_key": uav_demo.get("uav_cnnq_key"),
-            "uav_corrected_key": uav_demo["uav_corrected_key"],
+            "uav_corrected_key": uav_demo.get("uav_corrected_key"),
             "gsn_corrected_key": gsn_corrected_key,
             "raw_kdr": raw_kdr,
-            "active_target_kdr": active_target_kdr,
-            "corrected_kdr": corrected_kdr,
+            "cnn_kdr": cnn_kdr,
+            "cnnq_kdr": cnnq_kdr,
             "time": time.time(),
         }
         self.state_obj.latest_demo = snapshot
         self.state_obj.latest_demo_raw_kdr = raw_kdr
-        self.state_obj.latest_demo_target_kdr = active_target_kdr
-        self.state_obj.latest_demo_corr_kdr = corrected_kdr
+        self.state_obj.latest_demo_cnn_kdr = cnn_kdr
+        self.state_obj.latest_demo_cnnq_kdr = cnnq_kdr
 
         if epoch not in self.state_obj.demo_hist_epochs:
             self.state_obj.demo_raw_kdr_hist.append(raw_kdr)
-            self.state_obj.demo_corr_kdr_hist.append(corrected_kdr)
+            if cnn_kdr is not None:
+                self.state_obj.demo_cnn_kdr_hist.append(cnn_kdr)
+            if cnnq_kdr is not None:
+                self.state_obj.demo_cnnq_kdr_hist.append(cnnq_kdr)
             self.state_obj.demo_hist_epochs.add(epoch)
             if len(self.state_obj.demo_hist_epochs) > RAW_HISTORY_LIMIT:
                 self.state_obj.demo_hist_epochs.clear()
@@ -2070,17 +2429,33 @@ class GSNDashboard(tk.Tk):
             self.state_obj.latency_hist.append(latency_value)
             self.state_obj.latency_ema_hist.append(ema)
 
-    def _handle_eve_frame(self, frame, encrypted):
+    def _handle_eve_frame(self, frame, encrypted, decrypted=False):
         if frame is None:
             return
         with self.state_obj.lock:
             self.state_obj.latest_eve_video_bgr = frame.copy()
             self.state_obj.latest_eve_video_time = time.time()
             self.state_obj.latest_eve_video_encrypted = bool(encrypted)
+            self.state_obj.latest_eve_video_decrypted = bool(decrypted)
 
     def _get_key(self, epoch):
         with self.state_obj.lock:
             return self.state_obj.keys_by_epoch.get(epoch)
+
+    def _get_eve_key(self, epoch):
+        with self.state_obj.lock:
+            epoch_key = self.state_obj.eve_keys_by_epoch.get(epoch)
+            if epoch_key is not None:
+                return epoch_key
+
+            serial_pair = self.state_obj.epoch_serial_by_epoch.get(epoch)
+            if serial_pair is not None:
+                serial_pair = parse_serial_pair(serial_pair)
+                serial_key = self.state_obj.eve_aes_by_serial.get(serial_pair[0])
+                if serial_key is not None:
+                    return serial_key
+
+            return self.state_obj.latest_eve_aes_key
 
     @staticmethod
     def _kdr(a, b):
@@ -2115,6 +2490,8 @@ class GSNDashboard(tk.Tk):
                 eve_noise = self.state_obj.latest_eve_noise
                 eve_mac = self.state_obj.latest_eve_mac
                 eve_csi = None if self.state_obj.latest_eve_csi is None else self.state_obj.latest_eve_csi.copy()
+                eve_raw = self.state_obj.latest_eve_raw
+                eve_key_status = self.state_obj.latest_eve_key_status
                 gsn_live_serial = self.state_obj.latest_gsn_live_serial
                 gsn_live_csi = None if self.state_obj.latest_gsn_live_csi is None else self.state_obj.latest_gsn_live_csi.copy()
                 uav_live_serial = self.state_obj.latest_uav_live_serial
@@ -2135,12 +2512,13 @@ class GSNDashboard(tk.Tk):
                 demo = None if self.state_obj.latest_demo is None else dict(self.state_obj.latest_demo)
                 uav_demo = None if self.state_obj.latest_uav_demo is None else dict(self.state_obj.latest_uav_demo)
                 demo_raw_kdr = self.state_obj.latest_demo_raw_kdr
-                demo_target_kdr = self.state_obj.latest_demo_target_kdr
-                demo_corr_kdr = self.state_obj.latest_demo_corr_kdr
+                demo_cnn_kdr = self.state_obj.latest_demo_cnn_kdr
+                demo_cnnq_kdr = self.state_obj.latest_demo_cnnq_kdr
                 frame = None if self.state_obj.latest_frame_bgr is None else self.state_obj.latest_frame_bgr.copy()
                 eve_video_frame = None if self.state_obj.latest_eve_video_bgr is None else self.state_obj.latest_eve_video_bgr.copy()
                 eve_video_time = self.state_obj.latest_eve_video_time
                 eve_video_encrypted = self.state_obj.latest_eve_video_encrypted
+                eve_video_decrypted = self.state_obj.latest_eve_video_decrypted
                 video_encryption_enabled = self.state_obj.video_encryption_enabled
                 gsn_raw = self.state_obj.gsn_raw
                 aes_key = self.state_obj.active_key
@@ -2151,10 +2529,12 @@ class GSNDashboard(tk.Tk):
                 kdr_raw_hist = list(self.state_obj.kdr_raw_hist)
                 kdr_corr_hist = list(self.state_obj.kdr_corr_hist)
                 demo_raw_kdr_hist = list(self.state_obj.demo_raw_kdr_hist)
-                demo_corr_kdr_hist = list(self.state_obj.demo_corr_kdr_hist)
+                demo_cnn_kdr_hist = list(self.state_obj.demo_cnn_kdr_hist)
+                demo_cnnq_kdr_hist = list(self.state_obj.demo_cnnq_kdr_hist)
                 lat_hist = list(self.state_obj.latency_hist)
                 lat_ema_hist = list(self.state_obj.latency_ema_hist)
                 rssi_hist = list(self.state_obj.rssi_hist)
+                uav_rssi_hist = list(self.state_obj.uav_rssi_hist)
                 noise_hist = list(self.state_obj.noise_hist)
                 eve_rssi_hist = list(self.state_obj.eve_rssi_hist)
                 eve_noise_hist = list(self.state_obj.eve_noise_hist)
@@ -2166,9 +2546,8 @@ class GSNDashboard(tk.Tk):
                 bch_ok = self.state_obj.bch_started
                 demo_ok = self.state_obj.demo_telemetry_started
 
-            strip_raw_kdr = demo_raw_kdr if demo_raw_kdr is not None else raw_kdr
-            strip_corr_kdr = demo_corr_kdr if demo_corr_kdr is not None else corr_kdr
-            self.stats_strip.update(serial, rssi, noise, epoch, latency, latency_ema, strip_raw_kdr, strip_corr_kdr)
+            # strip_raw_kdr = demo_raw_kdr if demo_raw_kdr is not None else raw_kdr
+            self.stats_strip.update(serial, rssi, noise, epoch, latency, latency_ema, demo_raw_kdr, demo_cnn_kdr, demo_cnnq_kdr)
             snapshot = {
                 "serial": serial,
                 "rssi": rssi,
@@ -2178,6 +2557,8 @@ class GSNDashboard(tk.Tk):
                 "eve_noise": eve_noise,
                 "eve_mac": eve_mac,
                 "eve_csi": eve_csi,
+                "eve_raw": eve_raw,
+                "eve_key_status": eve_key_status,
                 "gsn_live_serial": gsn_live_serial,
                 "gsn_live_csi": gsn_live_csi,
                 "uav_live_serial": uav_live_serial,
@@ -2194,12 +2575,14 @@ class GSNDashboard(tk.Tk):
                 "demo": demo,
                 "uav_demo": uav_demo,
                 "demo_raw_kdr": demo_raw_kdr,
-                "demo_target_kdr": demo_target_kdr,
-                "demo_corr_kdr": demo_corr_kdr,
+                "demo_cnn_kdr": demo_cnn_kdr,
+                "demo_cnnq_kdr": demo_cnnq_kdr,
+                "uav_rssi_hist": uav_rssi_hist,
                 "frame": frame,
                 "eve_video_frame": eve_video_frame,
                 "eve_video_time": eve_video_time,
                 "eve_video_encrypted": eve_video_encrypted,
+                "eve_video_decrypted": eve_video_decrypted,
                 "video_encryption_enabled": video_encryption_enabled,
                 "gsn_raw": gsn_raw,
                 "aes_key": aes_key,
@@ -2210,7 +2593,8 @@ class GSNDashboard(tk.Tk):
                 "kdr_raw_hist": kdr_raw_hist,
                 "kdr_corr_hist": kdr_corr_hist,
                 "demo_raw_kdr_hist": demo_raw_kdr_hist,
-                "demo_corr_kdr_hist": demo_corr_kdr_hist,
+                "demo_cnn_kdr_hist": demo_cnn_kdr_hist,
+                "demo_cnnq_kdr_hist": demo_cnnq_kdr_hist,
                 "lat_hist": lat_hist,
                 "lat_ema_hist": lat_ema_hist,
                 "rssi_hist": rssi_hist,

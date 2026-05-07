@@ -251,6 +251,7 @@ def latest_uav_csi_for_telemetry():
         key_state.current_epoch(),
         cnn_csi,
         cnn_serial_pair,
+        snap.get("rssi")
     )
 
 
