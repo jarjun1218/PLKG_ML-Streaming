@@ -2,6 +2,7 @@
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import argparse
 
+import random
 import threading
 import time
 import socket
@@ -39,6 +40,8 @@ GSN_CSI_PORT = "/dev/cu.usbserial-0001"
 EVE_CSI_PORT = "/dev/cu.usbserial-3"
 CSI_BAUD = 115200
 RAW_HISTORY_LIMIT = 512
+EVE_KEY_UPDATE_INTERVAL_SEC = 7.5
+EVE_KEY_UPDATE_JITTER_SEC = 2.5
 DEMO_TELEMETRY_ENABLED = parse_telemetry_packet is not None
 VIDEO_VIEWPORT_MAX_W = 1920
 VIDEO_VIEWPORT_MAX_H = 1440
@@ -125,6 +128,11 @@ def set_gui_font_scale(value):
     return old_scale, GUI_FONT_SCALE
 
 
+def next_eve_key_update_delay():
+    jitter = random.uniform(-EVE_KEY_UPDATE_JITTER_SEC, EVE_KEY_UPDATE_JITTER_SEC)
+    return max(1.0, EVE_KEY_UPDATE_INTERVAL_SEC + jitter)
+
+
 def short_bits(bits, limit=64):
     if not bits:
         return "--"
@@ -198,16 +206,20 @@ class GSNState:
     latest_eve_mac: str | None = None
     latest_eve_csi_time: float | None = None
     latest_eve_raw: str | None = None
-    latest_eve_aes_key: bytes | None = None
-    latest_eve_key_status: str = "Waiting for EVE CSI."
+    active_eve_raw: str | None = None
+    active_eve_aes_key: bytes | None = None
+    active_eve_serial: int | None = None
+    active_eve_key_time: float | None = None
+    active_eve_next_update_time: float | None = None
+    latest_eve_key_status: str = "Waiting for independent EVE key schedule."
     eve_raw_by_serial: dict = field(default_factory=dict)
     eve_aes_by_serial: dict = field(default_factory=dict)
-    eve_keys_by_epoch: dict = field(default_factory=dict)
     pending_uav_csi_reset: bool = True
 
     last_epoch: int | None = None
     active_key: bytes | None = None
     keys_by_epoch: dict = field(default_factory=dict)
+    key_meta_by_epoch: dict = field(default_factory=dict)
     gsn_corrected_by_epoch: dict = field(default_factory=dict)
     epoch_serial_by_epoch: dict = field(default_factory=dict)
     uav_demo_by_epoch: dict = field(default_factory=dict)
@@ -527,10 +539,10 @@ class VideoModulePanel(ModulePanel):
         eve_time = self.snapshot.get("eve_video_time")
         eve_is_fresh = eve_time is not None and time.time() - eve_time <= 1.5
 
-        pip_w = int(w * 0.45)
-        pip_w = max(180, min(pip_w, 340, int(w * 0.42)))
+        pip_w = int(w * 0.5)
+        pip_w = max(250, min(pip_w, 340, int(w * 0.5)))
         pip_h = int(pip_w / VIDEO_VIEWPORT_ASPECT)
-        pip_h = max(105, min(pip_h, int(h * 0.42)))
+        pip_h = max(140, min(pip_h, int(h * 0.5)))
         pip_w = max(1, min(pip_w, w - 24))
         pip_h = max(1, min(pip_h, h - 24))
 
@@ -995,6 +1007,7 @@ class ChartModulePanel(ModulePanel):
                 ("UAV CNN CSI", demo.get("uav_cnn_csi") or uav_demo.get("uav_cnn_csi")),
                 ("GSN raw CSI", demo.get("gsn_raw_csi")),
                 # ("GSN raw CSI 2", demo.get("gsn_raw_csi_2")),
+                ("EVE CSI", demo.get("eve_csi")),
             ]
             plotted = False
             for label, values in series:
@@ -1005,11 +1018,11 @@ class ChartModulePanel(ModulePanel):
                     continue
                 self.ax.plot(range(len(wave)), wave, label=label, linewidth=1.7)
                 plotted = True
-            # self.ax.set_ylim(-0.05, 1.05)
+            self.ax.set_ylim(-0.1, 1.3)
             self.ax.set_yticks([])
             self.ax.set_title("CSI Waveform", color="#e5e7eb", fontsize=ui_font_size(10))
             if plotted:
-                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8))
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8), ncol=2, loc="upper right")
 
         elif self.content_key == "live_csi":
             series = [
@@ -1027,11 +1040,11 @@ class ChartModulePanel(ModulePanel):
                     continue
                 self.ax.plot(range(len(wave)), wave, label=label, linewidth=1.8)
                 plotted = True
-            self.ax.set_ylim(-0.15, 1.15)
+            self.ax.set_ylim(-0.1, 1.3)
             self.ax.set_title("Live CSI Waveform", color="#e5e7eb", fontsize=ui_font_size(10))
             self.ax.set_yticks([])
             if plotted:
-                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8))
+                self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8), ncol=2, loc="upper right")
 
         else:
             self.ax.set_xlim(0, 50)
@@ -1893,6 +1906,7 @@ class GSNDashboard(tk.Tk):
 
         last_serial = None
         last_eve_serial = None
+        next_eve_key_update = time.monotonic() + random.uniform(0.0, next_eve_key_update_delay())
         while True:
             try:
                 if eve_watcher is not None:
@@ -1905,11 +1919,20 @@ class GSNDashboard(tk.Tk):
                             eve_raw = None
                             eve_aes = None
                             eve_key_error = None
+                            promote_eve_key = False
+                            next_eve_delay = None
+                            next_eve_update_wall = None
                             if eve_csi is not None:
                                 eve_csi = np.asarray(eve_csi, dtype=np.float32)
                                 if eve_csi.ndim == 1 and len(eve_csi) >= 10:
                                     try:
                                         eve_raw, eve_aes = generate_key(eve_csi)
+                                        now_mono = time.monotonic()
+                                        if now_mono >= next_eve_key_update:
+                                            promote_eve_key = True
+                                            next_eve_delay = next_eve_key_update_delay()
+                                            next_eve_key_update = now_mono + next_eve_delay
+                                            next_eve_update_wall = time.time() + next_eve_delay
                                     except Exception as exc:
                                         eve_key_error = str(exc)
                             with self.state_obj.lock:
@@ -1921,18 +1944,42 @@ class GSNDashboard(tk.Tk):
                                 self.state_obj.latest_eve_csi = None if eve_csi is None else eve_csi.copy()
                                 if eve_raw is not None and eve_aes is not None and eve_serial is not None:
                                     self.state_obj.latest_eve_raw = eve_raw
-                                    self.state_obj.latest_eve_aes_key = eve_aes
-                                    self.state_obj.latest_eve_key_status = f"EVE raw key ready from serial {eve_serial}."
                                     self.state_obj.eve_raw_by_serial[eve_serial] = eve_raw
                                     self.state_obj.eve_aes_by_serial[eve_serial] = eve_aes
                                     self._trim_dict_locked(self.state_obj.eve_raw_by_serial, RAW_HISTORY_LIMIT)
                                     self._trim_dict_locked(self.state_obj.eve_aes_by_serial, RAW_HISTORY_LIMIT)
+                                    if promote_eve_key:
+                                        self.state_obj.active_eve_raw = eve_raw
+                                        self.state_obj.active_eve_aes_key = eve_aes
+                                        self.state_obj.active_eve_serial = eve_serial
+                                        self.state_obj.active_eve_key_time = time.time()
+                                        self.state_obj.active_eve_next_update_time = next_eve_update_wall
+                                        self.state_obj.latest_eve_key_status = (
+                                            f"Active EVE key serial {eve_serial}; "
+                                            f"next independent update in {next_eve_delay:.1f}s."
+                                        )
+                                    elif self.state_obj.active_eve_aes_key is None:
+                                        remaining = max(0.0, next_eve_key_update - time.monotonic())
+                                        self.state_obj.latest_eve_key_status = (
+                                            f"EVE observing serial {eve_serial}; first active key in {remaining:.1f}s."
+                                        )
+                                    else:
+                                        remaining = max(0.0, next_eve_key_update - time.monotonic())
+                                        self.state_obj.latest_eve_key_status = (
+                                            f"EVE observing serial {eve_serial}; active serial "
+                                            f"{self.state_obj.active_eve_serial}; next independent update in {remaining:.1f}s."
+                                        )
                                 elif eve_key_error:
                                     self.state_obj.latest_eve_key_status = f"EVE keygen failed: {eve_key_error}"
                                 if eve.get("rssi") is not None:
                                     self.state_obj.eve_rssi_hist.append(eve.get("rssi"))
                                 if eve.get("noise") is not None:
                                     self.state_obj.eve_noise_hist.append(eve.get("noise"))
+                            if promote_eve_key:
+                                self.log(
+                                    f"EVE independent key update: active serial={eve_serial}; "
+                                    f"next update in {next_eve_delay:.1f}s."
+                                )
                             if isinstance(eve_serial, int) and eve_serial % 20 == 0:
                                 self.log(
                                     f"Read EVE CSI seq {eve_serial} "
@@ -1987,45 +2034,6 @@ class GSNDashboard(tk.Tk):
                 self.log(f"Keygen loop error: {e}")
                 time.sleep(0.1)
 
-    def _try_eve_epoch_key(self, epoch, serial_pair, serial_token, helper, confirm):
-        serial_pair = parse_serial_pair(serial_pair)
-        serial = serial_pair[0]
-        with self.state_obj.lock:
-            if epoch in self.state_obj.eve_keys_by_epoch:
-                return "already", f"EVE key already ready for epoch={epoch}."
-            eve_raw = self.state_obj.eve_raw_by_serial.get(serial)
-            raw_source = f"serial {serial}"
-            if eve_raw is None and self.state_obj.latest_eve_raw is not None:
-                eve_raw = self.state_obj.latest_eve_raw
-                raw_source = f"latest serial {self.state_obj.latest_eve_serial if self.state_obj.latest_eve_serial is not None else '--'}"
-
-        if eve_raw is None:
-            message = f"EVE waiting for CSI before trying epoch={epoch} key."
-            with self.state_obj.lock:
-                self.state_obj.latest_eve_key_status = message
-            return "missing", message
-
-        try:
-            eve_corrected = bch_decode_key(eve_raw, helper)
-        except ValueError as exc:
-            message = f"EVE key mismatch for epoch={epoch} ({raw_source}); showing encrypted noise."
-            with self.state_obj.lock:
-                self.state_obj.latest_eve_key_status = message
-            return "failed", f"{message} {exc}"
-
-        eve_aes = sha256.sha_byte(eve_corrected)
-        if not verify_key_confirm(eve_aes, epoch, serial_token, helper, confirm):
-            message = f"EVE key confirmation failed for epoch={epoch} ({raw_source}); showing encrypted noise."
-            with self.state_obj.lock:
-                self.state_obj.latest_eve_key_status = message
-            return "failed", message
-
-        with self.state_obj.lock:
-            self.state_obj.eve_keys_by_epoch[epoch] = eve_aes
-            self._trim_dict_locked(self.state_obj.eve_keys_by_epoch, RAW_HISTORY_LIMIT)
-            self.state_obj.latest_eve_key_status = f"EVE key ready for epoch {epoch} from {raw_source}."
-        return "ready", f"EVE key ready for epoch={epoch} from {raw_source}; encrypted video will be tried with EVE key."
-
     def _bch_worker(self):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2039,12 +2047,9 @@ class GSNDashboard(tk.Tk):
             return
 
         last_epoch = -1
-        rejected_epochs = set()
-        seen_helper_epochs = set()
-        waiting_serial_epochs = set()
-        eve_key_logged_epochs = set()
-        eve_key_failed_epochs = set()
-        eve_key_missing_epochs = set()
+        rejected_helpers = set()
+        seen_helpers = set()
+        waiting_helpers = set()
         while True:
             try:
                 data, addr = sock.recvfrom(1024*1024)
@@ -2060,8 +2065,9 @@ class GSNDashboard(tk.Tk):
                 peer_serial = serial_pair[1] if len(serial_pair) > 1 else serial
                 helper = parts[3]
                 confirm = parts[4]
-                if epoch not in seen_helper_epochs:
-                    seen_helper_epochs.add(epoch)
+                helper_id = (epoch, serial_token, helper, confirm)
+                if helper_id not in seen_helpers:
+                    seen_helpers.add(helper_id)
                     self.log(
                         f"Received BCH helper epoch={epoch} serials={serial_pair_label(serial_pair)} "
                         f"from {addr[0]}:{addr[1]}."
@@ -2085,8 +2091,8 @@ class GSNDashboard(tk.Tk):
                         self.state_obj.video_status_level = "warn"
                     self.log(f"Sent RESET_CSI to UAV at {addr[0]}")
                     last_epoch = -1
-                    rejected_epochs.clear()
-                    waiting_serial_epochs.clear()
+                    rejected_helpers.clear()
+                    waiting_helpers.clear()
                     continue
 
                 if last_epoch >= 0 and epoch < last_epoch:
@@ -2100,37 +2106,42 @@ class GSNDashboard(tk.Tk):
                         self.state_obj.video_status = "UAV reboot detected. Waiting for key resync and fresh video."
                         self.state_obj.video_status_level = "warn"
                     self.log(f"UAV key session reset detected: epoch {last_epoch}->{epoch}")
-                    rejected_epochs.clear()
-                    waiting_serial_epochs.clear()
-                    eve_key_logged_epochs.clear()
-                    eve_key_failed_epochs.clear()
-                    eve_key_missing_epochs.clear()
+                    rejected_helpers.clear()
+                    waiting_helpers.clear()
                 last_epoch = epoch
 
                 with self.state_obj.lock:
                     self.state_obj.epoch_serial_by_epoch[epoch] = serial_pair
                     self._trim_dict_locked(self.state_obj.epoch_serial_by_epoch, RAW_HISTORY_LIMIT)
 
-                eve_status, eve_message = self._try_eve_epoch_key(epoch, serial_pair, serial_token, helper, confirm)
-                if eve_status == "ready" and epoch not in eve_key_logged_epochs:
-                    eve_key_logged_epochs.add(epoch)
-                    self.log(eve_message)
-                elif eve_status == "failed" and epoch not in eve_key_failed_epochs:
-                    eve_key_failed_epochs.add(epoch)
-                    self.log(eve_message)
-                elif eve_status == "missing" and epoch not in eve_key_missing_epochs:
-                    eve_key_missing_epochs.add(epoch)
-                    self.log(eve_message)
-
                 with self.state_obj.lock:
-                    already_ready = epoch in self.state_obj.keys_by_epoch
+                    existing_meta = self.state_obj.key_meta_by_epoch.get(epoch)
+                    already_ready = epoch in self.state_obj.keys_by_epoch and existing_meta == helper_id
+                    stale_same_epoch = epoch in self.state_obj.keys_by_epoch and existing_meta != helper_id
+                    if stale_same_epoch:
+                        self.state_obj.keys_by_epoch.pop(epoch, None)
+                        self.state_obj.key_meta_by_epoch.pop(epoch, None)
+                        self.state_obj.gsn_corrected_by_epoch.pop(epoch, None)
+                        if self.state_obj.last_epoch == epoch:
+                            self.state_obj.last_epoch = None
+                            self.state_obj.active_key = None
+                            self.state_obj.latest_frame_bgr = None
+                            self.state_obj.latest_frame_time = None
+                            self.state_obj.video_status = (
+                                f"Detected new helper for reused epoch={epoch}; recomputing key."
+                            )
+                            self.state_obj.video_status_level = "warn"
                 if already_ready:
                     try:
                         self._send_key_ack(addr[0], epoch, serial_token, confirm)
                     except Exception as exc:
                         self.log(f"Failed to resend KEY_ACK for epoch={epoch}: {exc}")
                     continue
-                if epoch in rejected_epochs:
+                if stale_same_epoch:
+                    self.log(
+                        f"Reused epoch={epoch} arrived with new helper/confirm; discarded stale local key and recomputing."
+                    )
+                if helper_id in rejected_helpers:
                     continue
 
                 with self.state_obj.lock:
@@ -2149,8 +2160,8 @@ class GSNDashboard(tk.Tk):
                             f"Waiting for local CSI serials={serial_pair_label(serial_pair)} before BCH correction."
                         )
                         self.state_obj.video_status_level = "warn"
-                    if epoch not in waiting_serial_epochs:
-                        waiting_serial_epochs.add(epoch)
+                    if helper_id not in waiting_helpers:
+                        waiting_helpers.add(helper_id)
                         self.log(
                             f"Waiting for local CSI serials={serial_pair_label(serial_pair)} "
                             f"for epoch={epoch}; missing={','.join(missing)}. "
@@ -2193,7 +2204,7 @@ class GSNDashboard(tk.Tk):
                     continue
                 aes = sha256.sha_byte(corrected)
                 if not verify_key_confirm(aes, epoch, serial_token, helper, confirm):
-                    rejected_epochs.add(epoch)
+                    rejected_helpers.add(helper_id)
                     with self.state_obj.lock:
                         self.state_obj.video_status = "Pending key confirmation failed. Keeping previous video key."
                         self.state_obj.video_status_level = "warn"
@@ -2205,8 +2216,10 @@ class GSNDashboard(tk.Tk):
                 demo_snapshot = None
                 with self.state_obj.lock:
                     self.state_obj.keys_by_epoch[epoch] = aes
+                    self.state_obj.key_meta_by_epoch[epoch] = helper_id
                     self.state_obj.gsn_corrected_by_epoch[epoch] = corrected
                     self.state_obj.epoch_serial_by_epoch[epoch] = serial_pair
+                    self._trim_dict_locked(self.state_obj.key_meta_by_epoch, RAW_HISTORY_LIMIT)
                     self._trim_dict_locked(self.state_obj.gsn_corrected_by_epoch, RAW_HISTORY_LIMIT)
                     self._trim_dict_locked(self.state_obj.epoch_serial_by_epoch, RAW_HISTORY_LIMIT)
                     demo_snapshot = self._refresh_demo_snapshot_locked(epoch)
@@ -2326,7 +2339,7 @@ class GSNDashboard(tk.Tk):
     def _clear_demo_session_locked(self):
         self.state_obj.gsn_corrected_by_epoch.clear()
         self.state_obj.epoch_serial_by_epoch.clear()
-        self.state_obj.eve_keys_by_epoch.clear()
+        self.state_obj.key_meta_by_epoch.clear()
         self.state_obj.uav_demo_by_epoch.clear()
         self.state_obj.latest_uav_demo = None
         self.state_obj.latest_demo = None
@@ -2347,7 +2360,6 @@ class GSNDashboard(tk.Tk):
         self.state_obj.latest_eve_video_time = None
         self.state_obj.latest_eve_video_encrypted = None
         self.state_obj.latest_eve_video_decrypted = None
-        self.state_obj.latest_eve_key_status = "Waiting for EVE epoch key."
         self.state_obj.demo_raw_kdr_hist.clear()
         self.state_obj.demo_cnn_kdr_hist.clear()
         self.state_obj.demo_cnnq_kdr_hist.clear()
@@ -2393,6 +2405,7 @@ class GSNDashboard(tk.Tk):
             "uav_cnnq_key": uav_demo.get("uav_cnnq_key"),
             "uav_corrected_key": uav_demo.get("uav_corrected_key"),
             "gsn_corrected_key": gsn_corrected_key,
+            "eve_csi": list(self.state_obj.latest_eve_csi) if self.state_obj.latest_eve_csi is not None else None,
             "raw_kdr": raw_kdr,
             "cnn_kdr": cnn_kdr,
             "cnnq_kdr": cnnq_kdr,
@@ -2456,18 +2469,7 @@ class GSNDashboard(tk.Tk):
 
     def _get_eve_key(self, epoch):
         with self.state_obj.lock:
-            epoch_key = self.state_obj.eve_keys_by_epoch.get(epoch)
-            if epoch_key is not None:
-                return epoch_key
-
-            serial_pair = self.state_obj.epoch_serial_by_epoch.get(epoch)
-            if serial_pair is not None:
-                serial_pair = parse_serial_pair(serial_pair)
-                serial_key = self.state_obj.eve_aes_by_serial.get(serial_pair[0])
-                if serial_key is not None:
-                    return serial_key
-
-            return self.state_obj.latest_eve_aes_key
+            return self.state_obj.active_eve_aes_key
 
     @staticmethod
     def _kdr(a, b):
@@ -2502,7 +2504,7 @@ class GSNDashboard(tk.Tk):
                 eve_noise = self.state_obj.latest_eve_noise
                 eve_mac = self.state_obj.latest_eve_mac
                 eve_csi = None if self.state_obj.latest_eve_csi is None else self.state_obj.latest_eve_csi.copy()
-                eve_raw = self.state_obj.latest_eve_raw
+                eve_raw = self.state_obj.active_eve_raw or self.state_obj.latest_eve_raw
                 eve_key_status = self.state_obj.latest_eve_key_status
                 gsn_live_serial = self.state_obj.latest_gsn_live_serial
                 gsn_live_csi = None if self.state_obj.latest_gsn_live_csi is None else self.state_obj.latest_gsn_live_csi.copy()
