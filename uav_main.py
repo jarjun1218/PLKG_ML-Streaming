@@ -11,6 +11,7 @@ Default key agreement path:
 6. UAV promotes pending key to active video key only after KEY_ACK
 """
 
+import argparse
 import threading
 import time
 import os
@@ -51,12 +52,39 @@ def _read_optional_number_env(name, default=None, cast=float):
     return cast(value)
 
 
+def _parse_resolution(value):
+    text = str(value).lower().replace(" ", "")
+    if "x" not in text:
+        raise argparse.ArgumentTypeError("resolution must use WIDTHxHEIGHT, for example 1280x720")
+    width_text, height_text = text.split("x", 1)
+    try:
+        width = int(width_text)
+        height = int(height_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("resolution width and height must be integers") from exc
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("resolution width and height must be positive")
+    return width, height
+
+
+def _parse_optional_int(value):
+    text = str(value).strip().lower()
+    if text in ("auto", "none", "null", "off"):
+        return None
+    return int(text)
+
+
+def _parse_optional_float(value):
+    text = str(value).strip().lower()
+    if text in ("auto", "none", "null", "off"):
+        return None
+    return float(text)
+
+
 # ======================================================
 # Config
 # ======================================================
-# GSN_IP = os.environ.get("GSN_IP", "192.168.0.104")
-GSN_IP = os.environ.get("GSN_IP", "192.168.0.149")
-# GSN_IP = os.environ.get("GSN_IP", "102.168.0.154")
+DEFAULT_GSN_IP = "192.168.0.149"
 CSI_PORT = "/dev/ttyUSB0"
 CSI_BAUD = 115200
 DEBUG = False
@@ -85,6 +113,77 @@ KEY_SOURCE = os.environ.get("PLKG_KEY_SOURCE", "cnnq").strip().lower()
 
 MODEL_CSI_PATH = "model_reserved/cnn_basic/model_final_test.pth"
 MODEL_KEY_QUAN_PATH = "model_reserved/cnn_basic_quan/model_final.pth"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run the UAV PLKG/video sender.")
+    parser.add_argument(
+        "--GSN-IP",
+        "--gsn-ip",
+        dest="gsn_ip",
+        default=DEFAULT_GSN_IP,
+        help=f"GSN receiver IP address. Default: {DEFAULT_GSN_IP}",
+    )
+    parser.add_argument(
+        "--video-resolution",
+        type=_parse_resolution,
+        default=VIDEO_RESOLUTION,
+        metavar="WIDTHxHEIGHT",
+        help=f"Camera/video resolution. Default: {VIDEO_RESOLUTION[0]}x{VIDEO_RESOLUTION[1]}",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=int,
+        default=VIDEO_FPS,
+        help=f"Camera/video FPS. Default: {VIDEO_FPS}",
+    )
+    parser.add_argument(
+        "--video-bitrate",
+        type=int,
+        default=VIDEO_H264_BITRATE,
+        help=f"H.264 bitrate in bits/sec. Default: {VIDEO_H264_BITRATE}",
+    )
+    parser.add_argument(
+        "--video-iperiod",
+        type=_parse_optional_int,
+        default=VIDEO_H264_IPERIOD,
+        help=f"H.264 I-frame interval. Use 'auto' for FPS-based interval. Default: {VIDEO_H264_IPERIOD}",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=VIDEO_JPEG_QUALITY,
+        help=f"Software JPEG quality fallback. Default: {VIDEO_JPEG_QUALITY}",
+    )
+    parser.add_argument(
+        "--video-chunk",
+        type=int,
+        default=VIDEO_CHUNK,
+        help=f"UDP payload chunk size. Default: {VIDEO_CHUNK}",
+    )
+    parser.add_argument(
+        "--fixed-exposure-us",
+        type=_parse_optional_int,
+        default=VIDEO_FIXED_EXPOSURE_US,
+        help="Fixed camera exposure time in microseconds. Use 'auto' for auto exposure. Default: auto",
+    )
+    parser.add_argument(
+        "--analogue-gain",
+        type=_parse_optional_float,
+        default=VIDEO_ANALOGUE_GAIN,
+        help="Fixed camera analogue gain. Use 'auto' for auto gain. Default: auto",
+    )
+    parser.add_argument(
+        "--software-jpeg",
+        action="store_true",
+        help="Disable hardware H.264 and use software JPEG fallback.",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Show local camera preview on the UAV.",
+    )
+    return parser.parse_args()
 
 
 # ======================================================
@@ -807,18 +906,30 @@ def control_thread():
 # MAIN
 # ======================================================
 if __name__ == "__main__":
+    args = parse_args()
+    gsn_ip = args.gsn_ip
+    print(f"[UAV] GSN target IP: {gsn_ip}")
+    print(
+        f"[UAV] video config: resolution={args.video_resolution}, fps={args.video_fps}, "
+        f"bitrate={args.video_bitrate}, iperiod={args.video_iperiod}, "
+        f"chunk={args.video_chunk}, "
+        f"exposure={'auto' if args.fixed_exposure_us is None else args.fixed_exposure_us}, "
+        f"gain={'auto' if args.analogue_gain is None else args.analogue_gain}, "
+        f"codec={'software JPEG' if args.software_jpeg else 'hardware H.264'}"
+    )
+
     # Key generation thread
     threading.Thread(target=keygen_thread, daemon=True).start()
     threading.Thread(target=control_thread, daemon=True).start()
 
     # Reconciliation helper sender
-    sender = UAVKeySender(key_state.for_reconciliation, GSN_IP, debug=DEBUG)
+    sender = UAVKeySender(key_state.for_reconciliation, gsn_ip, debug=DEBUG)
     threading.Thread(target=sender.run, daemon=True).start()
 
     if DEMO_TELEMETRY_ENABLED:
         demo_sender = DemoTelemetrySender(
             key_state.for_demo_telemetry,
-            GSN_IP,
+            gsn_ip,
             port=DEMO_TELEMETRY_PORT,
             debug=DEBUG,
         )
@@ -826,7 +937,7 @@ if __name__ == "__main__":
         if LiveCSITelemetrySender is not None:
             live_csi_sender = LiveCSITelemetrySender(
                 latest_uav_csi_for_telemetry,
-                GSN_IP,
+                gsn_ip,
                 port=DEMO_TELEMETRY_PORT,
                 debug=DEBUG,
                 send_interval=LIVE_CSI_TELEMETRY_INTERVAL_SEC,
@@ -842,19 +953,19 @@ if __name__ == "__main__":
     # Video streamer (preview in main thread is more stable)
     streamer = UAVVideoStreamer(
         key_state.for_video,
-        GSN_IP,
-        preview=PREVIEW,
+        gsn_ip,
+        preview=args.preview or PREVIEW,
         debug=DEBUG,
-        resolution=VIDEO_RESOLUTION,
-        fps=VIDEO_FPS,
-        h264_bitrate=VIDEO_H264_BITRATE,
-        h264_iperiod=VIDEO_H264_IPERIOD,
-        jpeg_quality=VIDEO_JPEG_QUALITY,
-        chunk=VIDEO_CHUNK,
+        resolution=args.video_resolution,
+        fps=args.video_fps,
+        h264_bitrate=args.video_bitrate,
+        h264_iperiod=args.video_iperiod,
+        jpeg_quality=args.jpeg_quality,
+        chunk=args.video_chunk,
         flip_code=VIDEO_FLIP_CODE,
-        fixed_exposure_us=VIDEO_FIXED_EXPOSURE_US,
-        analogue_gain=VIDEO_ANALOGUE_GAIN,
-        use_hardware_h264=VIDEO_USE_HARDWARE_H264,
+        fixed_exposure_us=args.fixed_exposure_us,
+        analogue_gain=args.analogue_gain,
+        use_hardware_h264=VIDEO_USE_HARDWARE_H264 and not args.software_jpeg,
         sync_port=TIME_SYNC_PORT,
         sync_samples=TIME_SYNC_SAMPLES,
         get_encryption_enabled=video_encryption_state.is_enabled,

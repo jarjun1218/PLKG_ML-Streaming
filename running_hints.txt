@@ -1,0 +1,31 @@
+/////////////////--GSN--//////////////////////////
+
+# run GUI with normal case
+python3 gsn_demo.py
+
+====================================================
+
+# run GUI with video flipped (camera equiped on UAV)
+python3 gsn_demo.py --video-flip both
+
+/////////////////--UAV--//////////////////
+
+# UAV setting GSN's IP
+source INFOCOM/bin/activate
+python3 uav_main.py # preset 192.168.0.149
+python3 uav_main.py --GSN-IP 192.168.X.X or --gsn-ip 192.168.X.X
+
+====================================================
+
+# with UAV camera setting (--help to view more)
+python3 uav_main.py \
+  --GSN-IP 192.168.2.1 \
+  --video-resolution 1280x720 \
+  --video-fps 30 \
+  --video-bitrate 4000000 \
+  --video-iperiod 15 \
+  --video-chunk 1200 \
+  --fixed-exposure-us auto \
+  --analogue-gain auto
+  --preview false
+  --software-jpeg false
