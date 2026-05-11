@@ -458,11 +458,15 @@ class UAVVideoStreamer:
                     self._record_stats(key_wait_frames=1)
                     continue
 
-                if encryption_enabled and (epoch != last_epoch or aes_cipher is None):
-                    aes_cipher = AESGCM(aes_key)
-                    last_epoch = epoch
-                elif not encryption_enabled:
+                if encryption_enabled:
+                    if aes_cipher is None or epoch != last_epoch:
+                        aes_cipher = AESGCM(aes_key)
+                        last_epoch = epoch
+                    send_epoch = last_epoch
+                else:
                     aes_cipher = None
+                    last_epoch = None
+                    send_epoch = epoch
 
                 self._send_encoded_bytes(
                     sock,
@@ -470,7 +474,7 @@ class UAVVideoStreamer:
                     capture_ts,
                     jpg.tobytes(),
                     aes_cipher,
-                    epoch,
+                    send_epoch,
                     CODEC_JPEG,
                     True,
                     encrypted=encryption_enabled,
@@ -508,11 +512,21 @@ class UAVVideoStreamer:
                     self._record_stats(key_wait_frames=1)
                     continue
 
-                if encryption_enabled and (epoch != last_epoch or aes_cipher is None):
-                    aes_cipher = AESGCM(aes_key)
-                    last_epoch = epoch
-                elif not encryption_enabled:
+                if encryption_enabled:
+                    key_changed = epoch != last_epoch
+                    if codec_tag == CODEC_H264 and not keyframe and (aes_cipher is None or key_changed):
+                        if aes_cipher is None:
+                            self._record_stats(key_wait_frames=1)
+                            continue
+                        epoch = last_epoch
+                    elif aes_cipher is None or key_changed:
+                        aes_cipher = AESGCM(aes_key)
+                        last_epoch = epoch
+                    send_epoch = last_epoch
+                else:
                     aes_cipher = None
+                    last_epoch = None
+                    send_epoch = epoch
 
                 self._send_encoded_bytes(
                     sock,
@@ -520,7 +534,7 @@ class UAVVideoStreamer:
                     encoded_ts,
                     encoded_bytes,
                     aes_cipher,
-                    epoch,
+                    send_epoch,
                     codec_tag,
                     keyframe,
                     encrypted=encryption_enabled,

@@ -1833,13 +1833,13 @@ class GSNDashboard(tk.Tk):
             if isinstance(panel, TextModulePanel) and panel.content_key == "log":
                 panel.render()
 
-    def _send_uav_control(self, message: bytes, target_ip=None):
+    def _send_uav_control(self, message: bytes, target_ip=None, repeat=3):
         target = target_ip or "255.255.255.255"
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             if target == "255.255.255.255":
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            for _ in range(3):
+            for _ in range(max(1, int(repeat))):
                 sock.sendto(message, (target, UAV_CONTROL_PORT))
                 time.sleep(0.03)
         finally:
@@ -1867,7 +1867,7 @@ class GSNDashboard(tk.Tk):
 
     def _send_key_ack(self, uav_ip, epoch, serial_token, confirm):
         command = f"KEY_ACK {int(epoch)} {serial_token} {confirm}".encode("ascii")
-        self._send_uav_control(command, target_ip=uav_ip)
+        self._send_uav_control(command, target_ip=uav_ip, repeat=1)
 
     def _sync_encrypt_button(self):
         with self.state_obj.lock:

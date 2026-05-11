@@ -861,7 +861,7 @@ def control_thread():
             ok, message = key_state.activate_pending_ack(epoch, parts[2], parts[3])
             if ok:
                 print(f"[UAV] GSN confirmed pending key; {message}")
-            else:
+            elif message != "no pending key":
                 print(f"[UAV] ignored KEY_ACK from {addr[0]}: {message}")
             continue
 
