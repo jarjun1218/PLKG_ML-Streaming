@@ -106,6 +106,7 @@ KEY_UPDATE_INTERVAL_SEC = 10.0
 KEY_ACK_TIMEOUT_SEC = float(os.environ.get("PLKG_KEY_ACK_TIMEOUT_SEC", "12.0"))
 LIVE_CSI_TELEMETRY_INTERVAL_SEC = 0.5
 LIVE_CNN_CSI_INTERVAL_SEC = _read_optional_number_env("PLKG_LIVE_CNN_CSI_INTERVAL_SEC", 1.0, float)
+TORCH_NUM_THREADS = int(os.environ.get("PLKG_TORCH_THREADS", "1"))
 CSI_PAIR_WAIT_LOG_INTERVAL_SEC = 5.0
 CSI_PAIR_WAIT_RESET_LOGS = 3
 CSI_PAIR_WAIT_RESET_COOLDOWN_SEC = 20.0
@@ -114,6 +115,22 @@ KEY_SOURCE = os.environ.get("PLKG_KEY_SOURCE", "cnnq").strip().lower()
 
 MODEL_CSI_PATH = "model_reserved/cnn_basic/model_final_test.pth"
 MODEL_KEY_QUAN_PATH = "model_reserved/cnn_basic_quan/model_final.pth"
+
+
+def configure_torch_threads(num_threads):
+    if num_threads is None or int(num_threads) <= 0:
+        return
+    num_threads = int(num_threads)
+    try:
+        torch.set_num_threads(num_threads)
+    except Exception as exc:
+        print(f"[UAV] failed to set torch num_threads={num_threads}: {exc}")
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+    except Exception as exc:
+        print(f"[UAV] failed to set torch interop threads: {exc}")
 
 
 def parse_args():
@@ -189,6 +206,18 @@ def parse_args():
         type=_parse_optional_float,
         default=LIVE_CNN_CSI_INTERVAL_SEC,
         help="Minimum seconds between live CNN CSI updates. Use 'off' to disable live CNN updates. Default: 1.0",
+    )
+    parser.add_argument(
+        "--key-update-interval",
+        type=float,
+        default=KEY_UPDATE_INTERVAL_SEC,
+        help=f"Minimum seconds between new key attempts. Default: {KEY_UPDATE_INTERVAL_SEC}",
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        default=TORCH_NUM_THREADS,
+        help=f"PyTorch CPU worker threads for CNN/CNN-Q inference. Default: {TORCH_NUM_THREADS}",
     )
     return parser.parse_args()
 
@@ -660,7 +689,10 @@ def select_latest_consecutive_pair(samples, last_pair_start=None):
 # ======================================================
 # THREAD 1: Key generation + CNN-Q + BCH
 # ======================================================
-def keygen_thread(live_cnn_interval_sec=LIVE_CNN_CSI_INTERVAL_SEC):
+def keygen_thread(
+    live_cnn_interval_sec=LIVE_CNN_CSI_INTERVAL_SEC,
+    key_update_interval_sec=KEY_UPDATE_INTERVAL_SEC,
+):
     global uav_csi_watcher
     model_csi = None
     model_q = None
@@ -772,18 +804,20 @@ def keygen_thread(live_cnn_interval_sec=LIVE_CNN_CSI_INTERVAL_SEC):
         live_cnn_due = (
             live_cnn_interval_sec is not None
             and model_csi is not None
+            and not keygen_due
             and now >= next_live_cnn_time
         )
+        keygen_needs_csi_cnn = keygen_due and key_source == "cnn"
 
         cnn_csi = None
         cnn_key = None
         cnnq_key = None
-        if model_csi is not None and (keygen_due or live_cnn_due):
+        if model_csi is not None and (keygen_needs_csi_cnn or live_cnn_due):
             try:
                 # === Step 2: CSI -> CNN -> corrected CSI -> CNN key diagnostic ===
                 cnn_csi = reconstruct_csi_cnn(model_csi, csi_1, csi_2)
                 key_state.update_live_cnn_csi((serial_1, serial_2), cnn_csi)
-                if keygen_due:
+                if keygen_needs_csi_cnn:
                     bits = quantization_1(cnn_csi, Nbits=2, inbits=13, guard=0)
                     cnn_key = force_102_bits("".join(str(b) for b in bits))
             except Exception as exc:
@@ -846,12 +880,15 @@ def keygen_thread(live_cnn_interval_sec=LIVE_CNN_CSI_INTERVAL_SEC):
         if pending_epoch is None:
             time.sleep(0.05)
             continue
-        next_keygen_time = time.monotonic() + KEY_UPDATE_INTERVAL_SEC
+        next_keygen_time = time.monotonic() + max(float(key_update_interval_sec), 0.0)
         direct_to_cnn = hamming_distance(direct_key, cnn_key)
         direct_to_cnnq = hamming_distance(direct_key, cnnq_key)
-        diag = ""
-        if direct_to_cnn is not None and direct_to_cnnq is not None:
-            diag = f" direct-vs-cnn={direct_to_cnn}/102 direct-vs-cnnq={direct_to_cnnq}/102"
+        diag_parts = []
+        if direct_to_cnn is not None:
+            diag_parts.append(f"direct-vs-cnn={direct_to_cnn}/102")
+        if direct_to_cnnq is not None:
+            diag_parts.append(f"direct-vs-cnnq={direct_to_cnnq}/102")
+        diag = "" if not diag_parts else " " + " ".join(diag_parts)
         print(
             f"[UAV] pending key epoch={pending_epoch} "
             f"serial_pair={serial_1},{serial_2} source={key_source}{diag} "
@@ -927,6 +964,7 @@ def control_thread():
 # ======================================================
 if __name__ == "__main__":
     args = parse_args()
+    configure_torch_threads(args.torch_threads)
     gsn_ip = args.gsn_ip
     print(f"[UAV] GSN target IP: {gsn_ip}")
     print(
@@ -936,11 +974,16 @@ if __name__ == "__main__":
         f"exposure={'auto' if args.fixed_exposure_us is None else args.fixed_exposure_us}, "
         f"gain={'auto' if args.analogue_gain is None else args.analogue_gain}, "
         f"codec={'software JPEG' if args.software_jpeg else 'hardware H.264'}, "
-        f"live_cnn_interval={'off' if args.live_cnn_interval is None else args.live_cnn_interval}"
+        f"live_cnn_interval={'off' if args.live_cnn_interval is None else args.live_cnn_interval}, "
+        f"key_update_interval={args.key_update_interval}, torch_threads={args.torch_threads}"
     )
 
     # Key generation thread
-    threading.Thread(target=keygen_thread, args=(args.live_cnn_interval,), daemon=True).start()
+    threading.Thread(
+        target=keygen_thread,
+        args=(args.live_cnn_interval, args.key_update_interval),
+        daemon=True,
+    ).start()
     threading.Thread(target=control_thread, daemon=True).start()
 
     # Reconciliation helper sender
