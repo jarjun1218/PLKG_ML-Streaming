@@ -105,6 +105,7 @@ UAV_CONTROL_PORT = 5008
 KEY_UPDATE_INTERVAL_SEC = 10.0
 KEY_ACK_TIMEOUT_SEC = float(os.environ.get("PLKG_KEY_ACK_TIMEOUT_SEC", "12.0"))
 LIVE_CSI_TELEMETRY_INTERVAL_SEC = 0.5
+LIVE_CNN_CSI_INTERVAL_SEC = _read_optional_number_env("PLKG_LIVE_CNN_CSI_INTERVAL_SEC", 1.0, float)
 CSI_PAIR_WAIT_LOG_INTERVAL_SEC = 5.0
 CSI_PAIR_WAIT_RESET_LOGS = 3
 CSI_PAIR_WAIT_RESET_COOLDOWN_SEC = 20.0
@@ -182,6 +183,12 @@ def parse_args():
         "--preview",
         action="store_true",
         help="Show local camera preview on the UAV.",
+    )
+    parser.add_argument(
+        "--live-cnn-interval",
+        type=_parse_optional_float,
+        default=LIVE_CNN_CSI_INTERVAL_SEC,
+        help="Minimum seconds between live CNN CSI updates. Use 'off' to disable live CNN updates. Default: 1.0",
     )
     return parser.parse_args()
 
@@ -653,7 +660,7 @@ def select_latest_consecutive_pair(samples, last_pair_start=None):
 # ======================================================
 # THREAD 1: Key generation + CNN-Q + BCH
 # ======================================================
-def keygen_thread():
+def keygen_thread(live_cnn_interval_sec=LIVE_CNN_CSI_INTERVAL_SEC):
     global uav_csi_watcher
     model_csi = None
     model_q = None
@@ -679,6 +686,7 @@ def keygen_thread():
     last_serial = None
     last_pair_start = None
     next_keygen_time = 0.0
+    next_live_cnn_time = 0.0
     last_wait_log = 0.0
     consecutive_pair_wait_logs = 0
     last_forced_csi_reset = 0.0
@@ -700,6 +708,7 @@ def keygen_thread():
             last_serial = None
             last_pair_start = None
             next_keygen_time = 0.0
+            next_live_cnn_time = 0.0
             consecutive_pair_wait_logs = 0
             last_wait_log = 0.0
             print("[UAV] keygen resync requested; waiting for fresh CSI")
@@ -758,28 +767,39 @@ def keygen_thread():
         # === Step 1: CSI direct quantization, aligned with GSN local keygen ===
         csi_1 = s1["csi"]
         csi_2 = s2["csi"]
-        direct_key = quantize_csi_direct(csi_1)
-        direct_key_2 = quantize_csi_direct(csi_2)
+        now = time.monotonic()
+        keygen_due = now >= next_keygen_time
+        live_cnn_due = (
+            live_cnn_interval_sec is not None
+            and model_csi is not None
+            and now >= next_live_cnn_time
+        )
 
         cnn_csi = None
         cnn_key = None
         cnnq_key = None
-        if model_csi is not None:
+        if model_csi is not None and (keygen_due or live_cnn_due):
             try:
                 # === Step 2: CSI -> CNN -> corrected CSI -> CNN key diagnostic ===
                 cnn_csi = reconstruct_csi_cnn(model_csi, csi_1, csi_2)
                 key_state.update_live_cnn_csi((serial_1, serial_2), cnn_csi)
-                bits = quantization_1(cnn_csi, Nbits=2, inbits=13, guard=0)
-                cnn_key = force_102_bits("".join(str(b) for b in bits))
+                if keygen_due:
+                    bits = quantization_1(cnn_csi, Nbits=2, inbits=13, guard=0)
+                    cnn_key = force_102_bits("".join(str(b) for b in bits))
             except Exception as exc:
                 print(f"[UAV] CNN diagnostic failed for serial_pair={serial_1},{serial_2}: {exc}")
                 cnn_csi = None
                 cnn_key = None
 
-        now = time.monotonic()
-        if now < next_keygen_time:
+            if live_cnn_interval_sec is not None:
+                next_live_cnn_time = now + max(float(live_cnn_interval_sec), 0.0)
+
+        if not keygen_due:
             time.sleep(0.01)
             continue
+
+        direct_key = quantize_csi_direct(csi_1)
+        direct_key_2 = quantize_csi_direct(csi_2)
 
         if model_q is not None:
             try:
@@ -915,11 +935,12 @@ if __name__ == "__main__":
         f"chunk={args.video_chunk}, "
         f"exposure={'auto' if args.fixed_exposure_us is None else args.fixed_exposure_us}, "
         f"gain={'auto' if args.analogue_gain is None else args.analogue_gain}, "
-        f"codec={'software JPEG' if args.software_jpeg else 'hardware H.264'}"
+        f"codec={'software JPEG' if args.software_jpeg else 'hardware H.264'}, "
+        f"live_cnn_interval={'off' if args.live_cnn_interval is None else args.live_cnn_interval}"
     )
 
     # Key generation thread
-    threading.Thread(target=keygen_thread, daemon=True).start()
+    threading.Thread(target=keygen_thread, args=(args.live_cnn_interval,), daemon=True).start()
     threading.Thread(target=control_thread, daemon=True).start()
 
     # Reconciliation helper sender
