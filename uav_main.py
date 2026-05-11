@@ -41,6 +41,16 @@ except ImportError as exc:
     DEMO_TELEMETRY_IMPORT_ERROR = exc
 
 
+def _read_optional_number_env(name, default=None, cast=float):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    value = value.strip()
+    if not value or value.lower() in ("auto", "none", "null", "off"):
+        return None
+    return cast(value)
+
+
 # ======================================================
 # Config
 # ======================================================
@@ -58,8 +68,8 @@ VIDEO_H264_IPERIOD = 15
 VIDEO_JPEG_QUALITY = 10
 VIDEO_CHUNK = 4096
 VIDEO_FLIP_CODE = None
-VIDEO_FIXED_EXPOSURE_US = 20000
-VIDEO_ANALOGUE_GAIN = 4
+VIDEO_FIXED_EXPOSURE_US = _read_optional_number_env("PLKG_VIDEO_FIXED_EXPOSURE_US", None, int)
+VIDEO_ANALOGUE_GAIN = _read_optional_number_env("PLKG_VIDEO_ANALOGUE_GAIN", None, float)
 VIDEO_USE_HARDWARE_H264 = True
 TIME_SYNC_PORT = 5006
 TIME_SYNC_SAMPLES = 8

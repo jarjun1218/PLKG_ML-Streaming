@@ -178,6 +178,50 @@ def serial_pair_label(pair):
     return ",".join(str(item) for item in parsed)
 
 
+VIDEO_FLIP_ALIASES = {
+    "none": None,
+    "off": None,
+    "no": None,
+    "false": None,
+    "vertical": 0,
+    "v": 0,
+    "top-bottom": 0,
+    "up-down": 0,
+    "horizontal": 1,
+    "h": 1,
+    "left-right": 1,
+    "mirror": 1,
+    "both": -1,
+    "rotate-180": -1,
+    "rot180": -1,
+    "180": -1,
+    "upside-down": -1,
+}
+
+
+def parse_video_flip(value):
+    text = str(value).strip().lower().replace("_", "-")
+    if text in VIDEO_FLIP_ALIASES:
+        return VIDEO_FLIP_ALIASES[text]
+    try:
+        code = int(text)
+    except ValueError as exc:
+        valid = "none, vertical, horizontal, both, 0, 1, -1"
+        raise argparse.ArgumentTypeError(f"invalid video flip '{value}' (use {valid})") from exc
+    if code in (-1, 0, 1):
+        return code
+    raise argparse.ArgumentTypeError("video flip code must be one of -1, 0, 1")
+
+
+def video_flip_label(code):
+    return {
+        None: "none",
+        0: "vertical",
+        1: "horizontal",
+        -1: "both / rotate-180",
+    }.get(code, str(code))
+
+
 @dataclass
 class GSNState:
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -1243,13 +1287,14 @@ class StatsStrip:
 
 
 class GSNDashboard(tk.Tk):
-    def __init__(self):
+    def __init__(self, video_flip_code=None):
         super().__init__()
         self.option_add("*Font", ui_font("Arial", 10))
         self.title("GSN Dashboard - PLKG Ground Station")
         self.geometry("1366x768")
         self.minsize(800, 500)
         self.configure(bg=APP_BG)
+        self.video_flip_code = video_flip_code
 
         self.state_obj = GSNState()
         self.log_queue = queue.Queue()
@@ -1272,6 +1317,8 @@ class GSNDashboard(tk.Tk):
         self._build_layout()
         self._schedule_updates()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self.video_flip_code is not None:
+            self.log(f"Video flip enabled: {video_flip_label(self.video_flip_code)}.")
 
     def _configure_style(self):
         style = ttk.Style(self)
@@ -2438,9 +2485,15 @@ class GSNDashboard(tk.Tk):
         finally:
             sock.close()
 
+    def _apply_video_flip(self, frame):
+        if self.video_flip_code is None:
+            return frame
+        return cv2.flip(frame, self.video_flip_code)
+
     def _handle_frame(self, frame, latency):
         if frame is None:
             return
+        frame = self._apply_video_flip(frame)
         with self.state_obj.lock:
             latency_value = float(latency)
             prev_ema = self.state_obj.latest_latency_ema_ms
@@ -2457,6 +2510,7 @@ class GSNDashboard(tk.Tk):
     def _handle_eve_frame(self, frame, encrypted, decrypted=False):
         if frame is None:
             return
+        frame = self._apply_video_flip(frame)
         with self.state_obj.lock:
             self.state_obj.latest_eve_video_bgr = frame.copy()
             self.state_obj.latest_eve_video_time = time.time()
@@ -2661,6 +2715,22 @@ class GSNDashboard(tk.Tk):
         self.destroy()
 
 
+def build_argparser():
+    parser = argparse.ArgumentParser(description="GSN PLKG dashboard")
+    parser.add_argument(
+        "--video-flip",
+        default=parse_video_flip(os.environ.get("GSN_VIDEO_FLIP", "none")),
+        type=parse_video_flip,
+        metavar="{none,vertical,horizontal,both}",
+        help=(
+            "flip received video before display; vertical=top/bottom, "
+            "horizontal=left/right, both=rotate 180 degrees"
+        ),
+    )
+    return parser
+
+
 if __name__ == "__main__":
-    app = GSNDashboard()
+    args = build_argparser().parse_args()
+    app = GSNDashboard(video_flip_code=args.video_flip)
     app.mainloop()

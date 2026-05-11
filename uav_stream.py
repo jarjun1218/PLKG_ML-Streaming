@@ -78,8 +78,8 @@ class UAVVideoStreamer:
         h264_iperiod=None,
         jpeg_quality=40,
         flip_code=None,
-        fixed_exposure_us=12000,
-        analogue_gain=1.0,
+        fixed_exposure_us=None,
+        analogue_gain=None,
         use_hardware_h264=True,
         sync_port=5006,
         sync_samples=8,
@@ -304,9 +304,17 @@ class UAVVideoStreamer:
                 controls["ExposureTime"] = min(self.fixed_exposure_us, frame_duration_us)
                 if self.analogue_gain is not None:
                     controls["AnalogueGain"] = self.analogue_gain
+            else:
+                controls["AeEnable"] = True
+                controls["AwbEnable"] = True
             cam.set_controls(controls)
         except Exception as e:
             print(f"[Cam Warning] {e}")
+
+    def _camera_control_summary(self):
+        if self.fixed_exposure_us is None:
+            return "exposure=auto, analogue_gain=auto"
+        return f"fixed_exposure={self.fixed_exposure_us}, analogue_gain={self.analogue_gain}"
 
     def _send_encoded_bytes(
         self,
@@ -585,8 +593,7 @@ class UAVVideoStreamer:
             print(
                 f"[UAV] hardware H.264 stream started: {self.resolution} @ {self.fps}fps, "
                 f"bitrate={self.h264_bitrate}, iperiod={self.h264_iperiod or max(1, int(self.fps))}, "
-                f"chunk={self.chunk}, fixed_exposure={self.fixed_exposure_us}, "
-                f"analogue_gain={self.analogue_gain}"
+                f"chunk={self.chunk}, {self._camera_control_summary()}"
             )
 
             while self.running:
@@ -657,8 +664,7 @@ class UAVVideoStreamer:
 
             print(
                 f"[UAV] software JPEG stream started: {self.resolution} @ {self.fps}fps, "
-                f"JPEG={self.jpeg_quality}, chunk={self.chunk}, "
-                f"fixed_exposure={self.fixed_exposure_us}, analogue_gain={self.analogue_gain}"
+                f"JPEG={self.jpeg_quality}, chunk={self.chunk}, {self._camera_control_summary()}"
             )
             self.running = True
 
