@@ -2,11 +2,13 @@
 
 # run GUI with normal case
 python3 gsn_demo.py
+python3 gsn_demo.py --GSN-ESP32-port /dev/cu.usbserial-0001
+python3 gsn_demo.py --GSN-ESP32-port /dev/cu.usbserial-0001 --EVE-ESP32-port /dev/cu.usbserial-3
 
 ====================================================
 
 # run GUI with video flipped (camera equiped on UAV)
-python3 gsn_demo.py --video-flip both
+python3 gsn_demo.py --video-flip both --GSN-ESP32-port /dev/cu.usbserial-0001
 
 /////////////////--UAV--//////////////////
 

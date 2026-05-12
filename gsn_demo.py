@@ -1287,7 +1287,7 @@ class StatsStrip:
 
 
 class GSNDashboard(tk.Tk):
-    def __init__(self, video_flip_code=None):
+    def __init__(self, video_flip_code=None, gsn_csi_port=GSN_CSI_PORT, eve_csi_port=EVE_CSI_PORT, csi_baud=CSI_BAUD):
         super().__init__()
         self.option_add("*Font", ui_font("Arial", 10))
         self.title("GSN Dashboard - PLKG Ground Station")
@@ -1295,6 +1295,9 @@ class GSNDashboard(tk.Tk):
         self.minsize(800, 500)
         self.configure(bg=APP_BG)
         self.video_flip_code = video_flip_code
+        self.gsn_csi_port = str(gsn_csi_port)
+        self.eve_csi_port = str(eve_csi_port)
+        self.csi_baud = int(csi_baud)
 
         self.state_obj = GSNState()
         self.log_queue = queue.Queue()
@@ -1317,6 +1320,8 @@ class GSNDashboard(tk.Tk):
         self._build_layout()
         self._schedule_updates()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.log(f"GSN ESP32 CSI port: {self.gsn_csi_port} @ {self.csi_baud}.")
+        self.log(f"EVE ESP32 CSI port: {self.eve_csi_port} @ {self.csi_baud}.")
         if self.video_flip_code is not None:
             self.log(f"Video flip enabled: {video_flip_label(self.video_flip_code)}.")
 
@@ -1929,27 +1934,33 @@ class GSNDashboard(tk.Tk):
 
     def _keygen_worker(self):
         try:
-            # watcher = CSISerialWatcher("/dev/ttyUSB0", 115200)
-            watcher = CSISerialWatcher(GSN_CSI_PORT, CSI_BAUD)  # macOS
-            # watcher = CSISerialWatcher("COM3", 115200)  # Windows
+            watcher = CSISerialWatcher(self.gsn_csi_port, self.csi_baud)
             watcher.start()
             with self.state_obj.lock:
                 self.state_obj.model_loaded = True
                 self.state_obj.serial_connected = True
-            self.log("GSN local quantizer ready. CNN/CNN-Q correction runs on UAV.")
+            self.log(
+                f"GSN CSI watcher started on {self.gsn_csi_port}. "
+                "Local quantizer ready; CNN/CNN-Q correction runs on UAV."
+            )
         except Exception as e:
-            self.log(f"Keygen init failed: {e}")
+            self.log(f"Keygen init failed on {self.gsn_csi_port}: {e}")
             return
 
         eve_watcher = None
         try:
-            eve_watcher = CSISerialWatcher(EVE_CSI_PORT, CSI_BAUD, endpoint_type="EVE", device="EVE")
+            eve_watcher = CSISerialWatcher(
+                self.eve_csi_port,
+                self.csi_baud,
+                endpoint_type="EVE",
+                device="EVE",
+            )
             eve_watcher.start()
             with self.state_obj.lock:
                 self.state_obj.eve_serial_connected = True
-            self.log(f"EVE CSI watcher started on {EVE_CSI_PORT}.")
+            self.log(f"EVE CSI watcher started on {self.eve_csi_port}.")
         except Exception as e:
-            self.log(f"EVE CSI watcher failed on {EVE_CSI_PORT}: {e}")
+            self.log(f"EVE CSI watcher failed on {self.eve_csi_port}: {e}")
 
         last_serial = None
         last_eve_serial = None
@@ -2718,6 +2729,33 @@ class GSNDashboard(tk.Tk):
 def build_argparser():
     parser = argparse.ArgumentParser(description="GSN PLKG dashboard")
     parser.add_argument(
+        "--GSN-ESP32-port",
+        "--gsn-esp32-port",
+        "--gsn-csi-port",
+        dest="gsn_esp32_port",
+        default=os.environ.get("GSN_CSI_PORT", GSN_CSI_PORT),
+        metavar="PORT",
+        help=f"serial port for the GSN ESP32 CSI receiver (default: {GSN_CSI_PORT})",
+    )
+    parser.add_argument(
+        "--EVE-ESP32-port",
+        "--eve-esp32-port",
+        "--eve-csi-port",
+        dest="eve_esp32_port",
+        default=os.environ.get("EVE_CSI_PORT", EVE_CSI_PORT),
+        metavar="PORT",
+        help=f"serial port for the EVE ESP32 CSI receiver (default: {EVE_CSI_PORT})",
+    )
+    parser.add_argument(
+        "--CSI-baud",
+        "--csi-baud",
+        dest="csi_baud",
+        type=int,
+        default=int(os.environ.get("CSI_BAUD", CSI_BAUD)),
+        metavar="BAUD",
+        help=f"baud rate for ESP32 CSI serial ports (default: {CSI_BAUD})",
+    )
+    parser.add_argument(
         "--video-flip",
         default=parse_video_flip(os.environ.get("GSN_VIDEO_FLIP", "none")),
         type=parse_video_flip,
@@ -2732,5 +2770,10 @@ def build_argparser():
 
 if __name__ == "__main__":
     args = build_argparser().parse_args()
-    app = GSNDashboard(video_flip_code=args.video_flip)
+    app = GSNDashboard(
+        video_flip_code=args.video_flip,
+        gsn_csi_port=args.gsn_esp32_port,
+        eve_csi_port=args.eve_esp32_port,
+        csi_baud=args.csi_baud,
+    )
     app.mainloop()
