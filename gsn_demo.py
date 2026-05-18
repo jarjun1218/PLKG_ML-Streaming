@@ -1069,9 +1069,14 @@ class ChartModulePanel(ModulePanel):
                 self.ax.legend(facecolor="#111827", edgecolor="#475569", labelcolor="#e5e7eb", fontsize=ui_font_size(8), ncol=2, loc="upper right")
 
         elif self.content_key == "live_csi":
+            demo = self.snapshot.get("demo") or {}
+            uav_demo = self.snapshot.get("uav_demo") or {}
+            uav_live_cnn_csi = self.snapshot.get("uav_live_cnn_csi")
+            if uav_live_cnn_csi is None:
+                uav_live_cnn_csi = demo.get("uav_cnn_csi") or uav_demo.get("uav_cnn_csi")
             series = [
                 ("UAV live CSI", self.snapshot.get("uav_live_csi")),
-                ("UAV CNN CSI", self.snapshot.get("uav_live_cnn_csi")),
+                ("UAV CNN CSI", uav_live_cnn_csi),
                 ("GSN live CSI", self.snapshot.get("gsn_live_csi")),
                 ("EVE live CSI", self.snapshot.get("eve_csi")),
             ]
@@ -2343,10 +2348,9 @@ class GSNDashboard(tk.Tk):
                     with self.state_obj.lock:
                         self.state_obj.latest_uav_live_serial = payload.get("serial")
                         self.state_obj.latest_uav_live_csi = live_csi.copy()
-                        self.state_obj.latest_uav_live_cnn_csi = (
-                            None if live_cnn_csi is None else live_cnn_csi.copy()
-                        )
-                        self.state_obj.latest_uav_live_cnn_serial_pair = payload.get("cnn_serial_pair")
+                        if live_cnn_csi is not None:
+                            self.state_obj.latest_uav_live_cnn_csi = live_cnn_csi.copy()
+                            self.state_obj.latest_uav_live_cnn_serial_pair = payload.get("cnn_serial_pair")
                         self.state_obj.latest_uav_live_epoch = payload.get("epoch")
                         self.state_obj.latest_uav_live_csi_time = payload.get("time", time.time())
                         if "uav_rssi" in payload and payload["uav_rssi"]:
@@ -2357,6 +2361,7 @@ class GSNDashboard(tk.Tk):
                 epoch = payload["epoch"]
                 serial = payload["serial"]
                 with self.state_obj.lock:
+                    payload = self._merge_demo_payload(self.state_obj.uav_demo_by_epoch.get(epoch), payload)
                     self.state_obj.uav_demo_by_epoch[epoch] = payload
                     self.state_obj.latest_uav_demo = dict(payload)
                     self.state_obj.latest_demo_telemetry_time = payload.get("time", time.time())
@@ -2544,6 +2549,44 @@ class GSNDashboard(tk.Tk):
         if L == 0:
             return 0.0
         return sum(a[i] != b[i] for i in range(L)) / L
+
+    @staticmethod
+    def _is_missing_demo_value(value):
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() == "" or value.strip().lower() == "none"
+        try:
+            return len(value) == 0
+        except TypeError:
+            return False
+
+    def _merge_demo_payload(self, existing, incoming):
+        if not existing:
+            return dict(incoming)
+        try:
+            existing_pair = parse_serial_pair(existing.get("serial_pair", (existing.get("serial"),)))
+            incoming_pair = parse_serial_pair(incoming.get("serial_pair", (incoming.get("serial"),)))
+        except (TypeError, ValueError):
+            return dict(incoming)
+        if existing_pair != incoming_pair:
+            return dict(incoming)
+
+        merged = dict(existing)
+        merged.update(incoming)
+        for key in (
+            "uav_cnn_csi",
+            "uav_cnn_key",
+            "uav_cnnq_key",
+            "uav_raw_csi",
+            "uav_raw_csi_2",
+            "uav_raw_key",
+            "uav_raw_key_2",
+            "uav_corrected_key",
+        ):
+            if key in existing and self._is_missing_demo_value(incoming.get(key)):
+                merged[key] = existing.get(key)
+        return merged
 
     def _schedule_updates(self):
         self.after_ids.append(self.after(50, self._drain_log_queue))

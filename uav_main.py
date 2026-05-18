@@ -81,6 +81,17 @@ def _parse_optional_float(value):
     return float(text)
 
 
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError("expected one of: on/off, true/false, 1/0")
+
+
 # ======================================================
 # Config
 # ======================================================
@@ -106,6 +117,7 @@ KEY_UPDATE_INTERVAL_SEC = 10.0
 KEY_ACK_TIMEOUT_SEC = float(os.environ.get("PLKG_KEY_ACK_TIMEOUT_SEC", "12.0"))
 LIVE_CSI_TELEMETRY_INTERVAL_SEC = 0.5
 LIVE_CNN_CSI_INTERVAL_SEC = _read_optional_number_env("PLKG_LIVE_CNN_CSI_INTERVAL_SEC", 1.0, float)
+DEMO_CNN_KEY_ENABLED = _parse_bool(os.environ.get("PLKG_DEMO_CNN_KEY", "on"))
 TORCH_NUM_THREADS = int(os.environ.get("PLKG_TORCH_THREADS", "1"))
 CSI_PAIR_WAIT_LOG_INTERVAL_SEC = 5.0
 CSI_PAIR_WAIT_RESET_LOGS = 3
@@ -206,6 +218,16 @@ def parse_args():
         type=_parse_optional_float,
         default=LIVE_CNN_CSI_INTERVAL_SEC,
         help="Minimum seconds between live CNN CSI updates. Use 'off' to disable live CNN updates. Default: 1.0",
+    )
+    parser.add_argument(
+        "--demo-cnn-key",
+        type=_parse_bool,
+        default=DEMO_CNN_KEY_ENABLED,
+        metavar="{on,off}",
+        help=(
+            "Generate the CSI-CNN diagnostic key for GSN demo display even when "
+            "the active BCH source is CNN-Q. Default: on"
+        ),
     )
     parser.add_argument(
         "--key-update-interval",
@@ -692,6 +714,7 @@ def select_latest_consecutive_pair(samples, last_pair_start=None):
 def keygen_thread(
     live_cnn_interval_sec=LIVE_CNN_CSI_INTERVAL_SEC,
     key_update_interval_sec=KEY_UPDATE_INTERVAL_SEC,
+    demo_cnn_key_enabled=DEMO_CNN_KEY_ENABLED,
 ):
     global uav_csi_watcher
     model_csi = None
@@ -731,7 +754,8 @@ def keygen_thread(
     print(
         f"[UAV] keygen started (BCH target={key_source}, "
         f"CNN={'on' if model_csi is not None else 'off'}, "
-        f"CNN-Q={'on' if model_q is not None else 'off'})"
+        f"CNN-Q={'on' if model_q is not None else 'off'}, "
+        f"demo_cnn_key={'on' if demo_cnn_key_enabled else 'off'})"
     )
 
     while True:
@@ -807,7 +831,9 @@ def keygen_thread(
             and not keygen_due
             and now >= next_live_cnn_time
         )
-        keygen_needs_csi_cnn = keygen_due and key_source == "cnn"
+        keygen_needs_csi_cnn = keygen_due and (
+            key_source == "cnn" or bool(demo_cnn_key_enabled)
+        )
 
         cnn_csi = None
         cnn_key = None
@@ -975,13 +1001,14 @@ if __name__ == "__main__":
         f"gain={'auto' if args.analogue_gain is None else args.analogue_gain}, "
         f"codec={'software JPEG' if args.software_jpeg else 'hardware H.264'}, "
         f"live_cnn_interval={'off' if args.live_cnn_interval is None else args.live_cnn_interval}, "
+        f"demo_cnn_key={'on' if args.demo_cnn_key else 'off'}, "
         f"key_update_interval={args.key_update_interval}, torch_threads={args.torch_threads}"
     )
 
     # Key generation thread
     threading.Thread(
         target=keygen_thread,
-        args=(args.live_cnn_interval, args.key_update_interval),
+        args=(args.live_cnn_interval, args.key_update_interval, args.demo_cnn_key),
         daemon=True,
     ).start()
     threading.Thread(target=control_thread, daemon=True).start()

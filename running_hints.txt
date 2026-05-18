@@ -28,6 +28,9 @@ python3 uav_main.py \
   --video-iperiod 15 \
   --video-chunk 1200 \
   --fixed-exposure-us auto \
-  --analogue-gain auto
-  --preview false
-  --software-jpeg false
+  --analogue-gain auto \
+  --demo-cnn-key on
+
+# optional boolean flags:
+python3 uav_main.py --preview
+python3 uav_main.py --software-jpeg
