@@ -40,8 +40,8 @@ GSN_CSI_PORT = "/dev/cu.usbserial-0001"
 EVE_CSI_PORT = "/dev/cu.usbserial-3"
 CSI_BAUD = 115200
 RAW_HISTORY_LIMIT = 512
-EVE_KEY_UPDATE_INTERVAL_SEC = 7.5
-EVE_KEY_UPDATE_JITTER_SEC = 2.5
+EVE_KEY_UPDATE_INTERVAL_SEC = 10
+EVE_KEY_UPDATE_JITTER_SEC = 0
 DEMO_TELEMETRY_ENABLED = parse_telemetry_packet is not None
 VIDEO_VIEWPORT_MAX_W = 1920
 VIDEO_VIEWPORT_MAX_H = 1440
@@ -267,6 +267,7 @@ class GSNState:
     gsn_corrected_by_epoch: dict = field(default_factory=dict)
     epoch_serial_by_epoch: dict = field(default_factory=dict)
     uav_demo_by_epoch: dict = field(default_factory=dict)
+    demo_eve_csi_by_epoch: dict = field(default_factory=dict)
     latest_uav_demo: dict | None = None
     latest_demo: dict | None = None
     latest_demo_telemetry_time: float | None = None
@@ -2404,6 +2405,7 @@ class GSNDashboard(tk.Tk):
         self.state_obj.epoch_serial_by_epoch.clear()
         self.state_obj.key_meta_by_epoch.clear()
         self.state_obj.uav_demo_by_epoch.clear()
+        self.state_obj.demo_eve_csi_by_epoch.clear()
         self.state_obj.latest_uav_demo = None
         self.state_obj.latest_demo = None
         self.state_obj.latest_demo_telemetry_time = None
@@ -2447,6 +2449,12 @@ class GSNDashboard(tk.Tk):
         if gsn_raw_key is None or gsn_raw_key_2 is None or gsn_raw_csi is None or gsn_raw_csi_2 is None:
             return None
 
+        eve_csi = self.state_obj.demo_eve_csi_by_epoch.get(epoch)
+        if eve_csi is None and self.state_obj.latest_eve_csi is not None:
+            eve_csi = np.asarray(self.state_obj.latest_eve_csi, dtype=np.float32).tolist()
+            self.state_obj.demo_eve_csi_by_epoch[epoch] = eve_csi
+            self._trim_dict_locked(self.state_obj.demo_eve_csi_by_epoch, RAW_HISTORY_LIMIT)
+
         raw_kdr = self._kdr(gsn_raw_key, uav_demo.get("uav_raw_key")) * 100.0
         cnn_kdr = self._kdr(gsn_raw_key, uav_demo.get("uav_cnn_key")) * 100.0 if uav_demo.get("uav_cnn_key") else None
         cnnq_kdr = self._kdr(gsn_raw_key, uav_demo.get("uav_cnnq_key")) * 100.0 if uav_demo.get("uav_cnnq_key") else None
@@ -2468,7 +2476,7 @@ class GSNDashboard(tk.Tk):
             "uav_cnnq_key": uav_demo.get("uav_cnnq_key"),
             "uav_corrected_key": uav_demo.get("uav_corrected_key"),
             "gsn_corrected_key": gsn_corrected_key,
-            "eve_csi": list(self.state_obj.latest_eve_csi) if self.state_obj.latest_eve_csi is not None else None,
+            "eve_csi": eve_csi,
             "raw_kdr": raw_kdr,
             "cnn_kdr": cnn_kdr,
             "cnnq_kdr": cnnq_kdr,
